@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+# 保存和加载模型检查点的实用程序函数
 
 def save_checkpoint(
     path: Path,

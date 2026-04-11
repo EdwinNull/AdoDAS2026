@@ -15,10 +15,14 @@ optimize/
 │   ├── temporal_augmentation.py       # 时序数据增强
 │   ├── modality_dropout.py            # 模态dropout
 │   └── README.md                      # 数据增强优化说明
-└── 03_feature_engineering/            # 特征工程优化
-    ├── feature_normalizer.py          # 特征归一化
-    ├── vad_enhancement.py             # VAD信号增强
-    └── README.md                      # 特征工程优化说明
+├── 03_feature_engineering/            # 特征工程优化
+│   ├── feature_normalizer.py          # 特征归一化
+│   ├── vad_enhancement.py             # VAD信号增强
+│   └── README.md                      # 特征工程优化说明
+└── 04_utils/                          # 工具函数优化
+    ├── metrics_optimized.py           # 阈值搜索 + QWK向量化
+    ├── ckpt_optimized.py              # 增强检查点 + Top-K管理
+    └── README.md                      # 工具函数优化说明
 ```
 
 ## 优化策略概览
@@ -33,6 +37,8 @@ optimize/
 | ⭐ **P1** | 模态dropout | 02_data_augmentation | 低 | 单模态鲁棒性+15% | 0.5天 |
 | 💡 **P2** | 混合对齐策略 | 01_data_quality | 高 | 2-3% | 3天 |
 | 💡 **P2** | VAD特征增强 | 03_feature_engineering | 中 | 2-3% | 1天 |
+| 🔥 **P0** | F1/QWK阈值搜索 | 04_utils | 低 | 2-5% | 0.5天 |
+| ⭐ **P1** | 增强检查点+Top-K | 04_utils | 低 | 防训练事故 | 0.5天 |
 
 **总预期提升**：综合实施P0+P1优化后，模型性能预计提升**10-15%**。
 

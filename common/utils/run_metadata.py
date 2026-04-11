@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
+# 获取当前Git提交的SHA-1哈希值，如果无法获取则返回"unknown"
 def _get_git_commit() -> str:
     try:
         result = subprocess.run(
