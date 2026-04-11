@@ -1,218 +1,146 @@
-# ADODAS数据加载优化策略
+# ADODAS 全局优化策略
 
-本目录包含针对ADODAS比赛数据加载模块的优化策略和实现代码。
+本目录包含针对 ADODAS 比赛的系统性优化方案，覆盖数据、特征、模型、损失函数和训练策略五个层面。
 
 ## 目录结构
 
 ```
 optimize/
-├── README.md                           # 本文件：优化策略总览
+├── README.md                           # 本文件：全局优化策略总览
 ├── 01_data_quality/                    # 数据质量优化
 │   ├── adaptive_mask.py               # 自适应掩码策略
 │   ├── interpolated_alignment.py      # 混合时间对齐策略
-│   └── README.md                      # 数据质量优化说明
+│   └── README.md
 ├── 02_data_augmentation/              # 数据增强优化
-│   ├── temporal_augmentation.py       # 时序数据增强
-│   ├── modality_dropout.py            # 模态dropout
-│   └── README.md                      # 数据增强优化说明
+│   ├── temporal_augmentation.py       # 时序数据增强（Time Masking + Speed Perturb）
+│   ├── modality_dropout.py            # 模态整体 dropout
+│   └── README.md
 ├── 03_feature_engineering/            # 特征工程优化
-│   ├── feature_normalizer.py          # 特征归一化
-│   ├── vad_enhancement.py             # VAD信号增强
-│   └── README.md                      # 特征工程优化说明
-└── 04_utils/                          # 工具函数优化
-    ├── metrics_optimized.py           # 阈值搜索 + QWK向量化
-    ├── ckpt_optimized.py              # 增强检查点 + Top-K管理
-    └── README.md                      # 工具函数优化说明
+│   ├── feature_normalizer.py          # 特征 z-score 归一化
+│   ├── vad_enhancement.py             # VAD 信号增强
+│   └── README.md
+├── 04_utils/                          # 工具函数优化
+│   ├── metrics_optimized.py           # F1 阈值搜索 + QWK 向量化
+│   ├── ckpt_optimized.py              # 增强检查点 + Top-K 管理
+│   └── README.md
+├── 05_model_architecture/             # 模型架构优化 ★ 新增
+│   ├── cross_modal_attention.py       # 跨模态交叉注意力
+│   ├── modality_gating.py             # 自适应模态门控融合
+│   ├── aggregator_enhanced.py         # 增强的跨会话聚合器
+│   └── README.md
+├── 06_loss_functions/                 # 损失函数优化 ★ 新增
+│   ├── asymmetric_loss.py             # ASL + Soft-F1（A1 任务）
+│   ├── ordinal_loss_enhanced.py       # CORN + 可微 QWK（A2 任务）
+│   └── README.md
+└── 07_training_strategy/              # 训练策略优化 ★ 新增
+    ├── mixup.py                       # Mixup 数据增强
+    ├── multi_sample_dropout.py        # 多采样 Dropout
+    ├── swa.py                         # 随机权重平均 (SWA)
+    ├── ema.py                         # 指数移动平均 (EMA)
+    └── README.md
 ```
 
-## 优化策略概览
+## 发现的关键问题
 
-### 实施优先级
+### 代码缺陷（必须修复）
 
-| 优先级 | 优化项 | 目录 | 实施难度 | 预期提升 | 实施时间 |
-|--------|--------|------|----------|----------|----------|
-| 🔥 **P0** | 特征归一化 | 03_feature_engineering | 低 | 3-5% | 1天 |
-| 🔥 **P0** | 时序数据增强 | 02_data_augmentation | 中 | 5-10% | 2天 |
-| ⭐ **P1** | 自适应掩码策略 | 01_data_quality | 中 | 数据利用率+20% | 1天 |
-| ⭐ **P1** | 模态dropout | 02_data_augmentation | 低 | 单模态鲁棒性+15% | 0.5天 |
-| 💡 **P2** | 混合对齐策略 | 01_data_quality | 高 | 2-3% | 3天 |
-| 💡 **P2** | VAD特征增强 | 03_feature_engineering | 中 | 2-3% | 1天 |
-| 🔥 **P0** | F1/QWK阈值搜索 | 04_utils | 低 | 2-5% | 0.5天 |
-| ⭐ **P1** | 增强检查点+Top-K | 04_utils | 低 | 防训练事故 | 0.5天 |
+| 问题 | 位置 | 影响 | 修复方案 |
+|------|------|------|----------|
+| `a1_loss` 签名不匹配 | heads.py vs runner.py | **运行时报错** | `06_loss_functions/asymmetric_loss.py` |
+| `a2_ordinal_loss` 签名不匹配 | heads.py vs runner.py | **运行时报错** | `06_loss_functions/ordinal_loss_enhanced.py` |
+| ASL/CORN/QWK 损失未实现 | heads.py | 配置声明但无效果 | 同上 |
+| BackboneConfig 缺少层次化编码器参数 | mtcn_backbone.py | 配置传入被静默忽略 | 需评估是否真正需要 |
+| submissions 目录未创建 | run_naming.py | 推理时 FileNotFoundError | runner.py 已有 workaround |
 
-**总预期提升**：综合实施P0+P1优化后，模型性能预计提升**10-15%**。
+### 架构瓶颈（提升空间最大）
 
-## 快速开始
+| 瓶颈 | 当前做法 | 问题 | 优化方案 |
+|------|----------|------|----------|
+| 跨模态融合过晚 | 最终层线性拼接 | 无法捕捉时序级跨模态关联 | `05_model_architecture/cross_modal_attention.py` |
+| 模态权重固定 | 拼接后线性投影 | 低质量模态干扰预测 | `05_model_architecture/modality_gating.py` |
+| 训练正则化不足 | 仅 feature_noise + session_drop | ~1000 样本严重过拟合 | `07_training_strategy/mixup.py` |
+| 单 checkpoint 方差大 | 保存最佳 epoch | 不同 seed 差 5%+ | `07_training_strategy/swa.py` + `ema.py` |
 
-### 1. 特征归一化（P0，最高优先级）
+## 优化策略优先级总表
+
+### P0（必做，预期综合提升 10~20%）
+
+| 序号 | 优化项 | 目录 | 改动量 | 预期提升 |
+|------|--------|------|--------|----------|
+| 1 | **修复损失函数接口** | 06_loss_functions | 替换2个函数 | 修复运行时错误 |
+| 2 | **ASL + Soft-F1 联合损失** | 06_loss_functions | 同上 | A1 F1 +3~8% |
+| 3 | **CORN + 可微 QWK 损失** | 06_loss_functions | 同上 | A2 QWK +3~8% |
+| 4 | **Mixup 正则化** | 07_training_strategy | 训练循环加3行 | QWK/F1 +2~5% |
+| 5 | **特征归一化** | 03_feature_engineering | 数据集加一步 | 收敛加速 +3~5% |
+| 6 | **时序数据增强** | 02_data_augmentation | 数据集集成 | QWK +5~10% |
+| 7 | **F1/QWK 阈值搜索** | 04_utils | 已实现，需集成 | F1/QWK +2~5% |
+
+### P1（推荐，预期额外提升 5~10%）
+
+| 序号 | 优化项 | 目录 | 改动量 | 预期提升 |
+|------|--------|------|--------|----------|
+| 8 | 跨模态交叉注意力 | 05_model_architecture | backbone 加一层 | QWK +2~5% |
+| 9 | 自适应模态门控 | 05_model_architecture | 替换 fusion_mlp | QWK +1~3% |
+| 10 | 增强跨会话聚合器 | 05_model_architecture | 替换 aggregator | QWK +1~3% |
+| 11 | Multi-Sample Dropout | 07_training_strategy | 包装 task_head | QWK/F1 +1~2% |
+| 12 | EMA / SWA | 07_training_strategy | 训练循环加几行 | QWK +1~3% |
+| 13 | 自适应掩码 | 01_data_quality | 替换掩码方法 | 数据利用率 +20% |
+| 14 | 模态 Dropout | 02_data_augmentation | 训练循环加一步 | 鲁棒性 +15% |
+| 15 | Top-K 检查点 | 04_utils | 替换保存逻辑 | 防止训练事故 |
+
+### P2（可选，边际收益）
+
+| 序号 | 优化项 | 目录 | 预期提升 |
+|------|--------|------|----------|
+| 16 | 混合时间对齐 | 01_data_quality | 2~3% |
+| 17 | VAD 特征增强 | 03_feature_engineering | 2~3% |
+
+## 快速集成路径
+
+### 最小改动方案（修复错误 + 损失函数升级，30分钟）
 
 ```python
-from docs.optimize.feature_engineering.feature_normalizer import FeatureNormalizer
+# 步骤1：将 asymmetric_loss.py 中的 a1_loss_enhanced 复制到 heads.py
+# 步骤2：将 ordinal_loss_enhanced.py 中的 a2_ordinal_loss_enhanced 复制到 heads.py
+# 步骤3：更新导入
 
-# 步骤1：在训练集上计算统计量
-normalizer = FeatureNormalizer.compute_from_dataset(
-    dataset=train_dataset,
-    save_path="stats/feature_stats.pt"
-)
-
-# 步骤2：在数据集中集成
-train_dataset.normalizer = normalizer
-val_dataset.normalizer = normalizer
-test_dataset.normalizer = normalizer
+# 在 heads.py 末尾：
+# 替换原 a1_loss → a1_loss_enhanced（函数名改为 a1_loss 即可）
+# 替换原 a2_ordinal_loss → a2_ordinal_loss_enhanced（同理）
 ```
 
-### 2. 时序数据增强（P0）
+### 标准方案（P0 全部实施，1~2天）
 
-```python
-from docs.optimize.data_augmentation.temporal_augmentation import TemporalAugmentation
+在最小改动基础上：
+1. 集成特征归一化（`03_feature_engineering/feature_normalizer.py`）
+2. 集成时序增强（`02_data_augmentation/temporal_augmentation.py`）
+3. 训练循环加入 Mixup（`07_training_strategy/mixup.py`）
 
-# 创建增强器
-augmentation = TemporalAugmentation(
-    time_mask_prob=0.15,
-    speed_perturb_prob=0.3,
-)
+### 完整方案（P0+P1，3~5天）
 
-# 在数据集中集成
-train_dataset = MultimodalDataset(
-    manifest_path="train.csv",
-    cfg=cfg,
-    split="train",
-    augmentation=augmentation,  # 只在训练集使用
-)
+在标准方案基础上：
+1. 加入跨模态注意力和门控融合
+2. 替换聚合器
+3. 加入 EMA + SWA
+4. 加入 Multi-Sample Dropout
+
+## 各层优化的独立性
+
 ```
+数据层      ──→ 特征层      ──→ 模型层       ──→ 损失层       ──→ 训练层
+01/02/03          03            05              06              07/04
 
-### 3. 自适应掩码策略（P1）
-
-```python
-from docs.optimize.data_quality.adaptive_mask import compute_adaptive_mask
-
-# 在dataset.py中替换_compute_modality_mask方法
-mask_audio = compute_adaptive_mask(
-    audio_mask_parts, audio_mask_names, cfg.core_audio, T
-)
+每层优化独立有效，可以按优先级逐步叠加。
+低层优化（数据/特征）改善输入质量，高层优化（模型/损失/训练）改善学习效率。
+同时优化多层通常有叠加效果（非线性组合，总提升 > 各项之和）。
 ```
-
-### 4. 模态dropout（P1）
-
-```python
-from docs.optimize.data_augmentation.modality_dropout import ModalityDropout
-
-# 创建模态dropout
-modality_dropout = ModalityDropout(
-    audio_drop_prob=0.1,
-    video_drop_prob=0.1,
-)
-
-# 在训练循环中应用
-for batch in train_loader:
-    if training:
-        batch = modality_dropout(batch)
-    # ... 正常训练流程
-```
-
-## 集成示例
-
-完整的训练脚本集成示例：
-
-```python
-from common.data.dataset import MultimodalDataset, FeatureConfig, collate_fn
-from docs.optimize.feature_engineering.feature_normalizer import FeatureNormalizer
-from docs.optimize.data_augmentation.temporal_augmentation import TemporalAugmentation
-from docs.optimize.data_augmentation.modality_dropout import ModalityDropout
-
-# 配置
-cfg = FeatureConfig(
-    feature_root="path/to/features",
-    mask_policy="adaptive",  # 使用自适应掩码
-)
-
-# 步骤1：计算归一化统计量（只需运行一次）
-normalizer = FeatureNormalizer.compute_from_dataset(
-    dataset=MultimodalDataset("train.csv", cfg, "train"),
-    save_path="stats/feature_stats.pt"
-)
-
-# 步骤2：创建增强器
-temporal_aug = TemporalAugmentation(
-    time_mask_prob=0.15,
-    speed_perturb_prob=0.3,
-)
-modality_dropout = ModalityDropout(
-    audio_drop_prob=0.1,
-    video_drop_prob=0.1,
-)
-
-# 步骤3：创建数据集
-train_dataset = MultimodalDataset(
-    manifest_path="train.csv",
-    cfg=cfg,
-    split="train",
-    augmentation=temporal_aug,
-    normalizer=normalizer,
-)
-
-val_dataset = MultimodalDataset(
-    manifest_path="val.csv",
-    cfg=cfg,
-    split="val",
-    normalizer=normalizer,  # 验证集只用归一化，不用增强
-)
-
-# 步骤4：创建数据加载器
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=32,
-    shuffle=True,
-    collate_fn=collate_fn,
-)
-
-# 步骤5：训练循环
-for epoch in range(num_epochs):
-    for batch in train_loader:
-        # 应用模态dropout
-        batch = modality_dropout(batch)
-        
-        # 正常训练流程
-        outputs = model(batch)
-        loss = criterion(outputs, batch["y_a1"])
-        loss.backward()
-        optimizer.step()
-```
-
-## 性能基准
-
-### 优化前（Baseline）
-
-- 训练集大小：1000样本
-- 有效数据利用率：70%（30%因掩码策略被丢弃）
-- 验证集MAE：8.5
-- 单模态缺失时MAE：12.3（性能下降45%）
-
-### 优化后（P0+P1实施）
-
-- 训练集大小：1000样本
-- 有效数据利用率：90%（自适应掩码）
-- 验证集MAE：7.2（提升15%）
-- 单模态缺失时MAE：9.1（性能下降26%，鲁棒性提升）
-
-## 注意事项
-
-1. **归一化统计量**：必须在训练集上计算，不能包含验证集/测试集数据
-2. **数据增强**：只在训练集使用，验证集/测试集不使用
-3. **模态dropout**：建议从较小概率（0.05）开始，逐步增加
-4. **时序增强**：速度扰动范围不宜过大，建议[0.9, 1.1]
-
-## 贡献指南
-
-如果你有新的优化策略，请按以下格式添加：
-
-1. 在对应目录下创建Python文件
-2. 添加详细的文档字符串和注释
-3. 在该目录的README.md中添加说明
-4. 更新本文件的优化策略概览表
 
 ## 参考文献
 
-- SpecAugment: A Simple Data Augmentation Method for ASR (Park et al., 2019)
-- mixup: Beyond Empirical Risk Minimization (Zhang et al., 2018)
-- Temporal Segment Networks (Wang et al., 2016)
+- Asymmetric Loss: Ridnik et al., ICCV 2021
+- CORN: Shi et al., Pattern Recognition 2021
+- Mixup: Zhang et al., ICLR 2018
+- Multi-Sample Dropout: Inoue, 2019
+- SWA: Izmailov et al., UAI 2018
+- Bottleneck Transformers: Nagrani et al., ICML 2021
+- SpecAugment: Park et al., Interspeech 2019

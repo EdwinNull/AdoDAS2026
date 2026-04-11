@@ -23,33 +23,20 @@ mask_policy: and_core
 core_audio: [mel_mfcc, ssl_embed]
 core_video: [vision_ssl_embed, qc_stats]
 
-# 架构参数 (基于AdoDAS 2026技术指南)
 d_adapter: 64
-d_model: 512
+d_model: 256
 tcn_layers: 6
 tcn_kernel_size: 3
 asp_alpha: 0.5
 asp_beta: 0.5
 dropout: 0.2
-d_shared: 512
+d_shared: 256
 
-# 层级化Transformer配置
-use_hierarchical_encoder: true
-n_unimodal_layers: 4
-n_fusion_layers: 2
-n_bottleneck_tokens: 4
-n_perceiver_queries: 32
-temporal_stride: 4
-
-# 聚合器配置
-aggregator: attention
+aggregator: mlp
 use_coral: true
-
-# 训练参数 (基于AdoDAS 2026技术指南优化)
 batch_size: 64
-lr: 3e-5
+lr: 0.001
 weight_decay: 0.01
-warmup_ratio: 0.06
 warmup_epochs: 3
 epochs: 40
 seed: 42
@@ -57,27 +44,13 @@ num_workers: 8
 amp: true
 preload: true
 grad_clip: 1.0
-grad_accumulation: 4
 use_pos_weight: true
-patience: 10
-
-# 损失函数配置 (CORN + QWK组合)
-use_corn_loss: true
-use_qwk_aux: true
-qwk_weight: 0.3
-label_smoothing: 0.1
-
-# 会话损失权重
+patience: 8
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
-
-# 数据增强
-feature_noise_std: 0.01
-feature_mask_prob: 0.1
-mixup_alpha: 0.2
-session_drop_prob: 0.2
-
-# 提交配置
 submission_level: participant
 decode_method: auto
+label_smoothing: 0.05
+feature_noise_std: 0.01
+session_drop_prob: 0.1
 early_stop_metric: val_loss

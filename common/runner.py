@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from contextlib import nullcontext
 import yaml
 
 from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
@@ -76,27 +75,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--session_type_loss_weight", type=float, default=None)
     p.add_argument("--use_coral", type=int, default=None, help="1=use CORAL head for A2")
 
-    p.add_argument("--use_hierarchical_encoder", type=int, default=None, help="1=use hierarchical transformer")
-    p.add_argument("--n_unimodal_layers", type=int, default=None)
-    p.add_argument("--n_fusion_layers", type=int, default=None)
-    p.add_argument("--n_bottleneck_tokens", type=int, default=None)
-    p.add_argument("--n_perceiver_queries", type=int, default=None)
-    p.add_argument("--temporal_stride", type=int, default=None)
-
-    p.add_argument("--use_combined_loss", type=int, default=None, help="1=use ASL+SoftF1 for A1")
-    p.add_argument("--use_corn_loss", type=int, default=None, help="1=use CORN+QWK for A2")
-    p.add_argument("--use_qwk_aux", type=int, default=None, help="1=use QWK auxiliary loss")
-    p.add_argument("--qwk_weight", type=float, default=None)
-    p.add_argument("--soft_f1_weight", type=float, default=None)
-    p.add_argument("--gamma_neg", type=float, default=None)
-    p.add_argument("--gamma_pos", type=float, default=None)
-    p.add_argument("--asl_clip", type=float, default=None)
-
-    p.add_argument("--mixup_alpha", type=float, default=None)
-    p.add_argument("--feature_mask_prob", type=float, default=None)
-    p.add_argument("--temporal_dropout_prob", type=float, default=None)
-    p.add_argument("--use_specaugment", type=int, default=None)
-
     p.add_argument("--submission_level", type=str, default=None,
                     choices=["session", "participant"], help="Use participant-level preds for submission")
     p.add_argument("--decode_method", type=str, default=None,
@@ -112,8 +90,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--warmup_epochs", type=int, default=None)
-    p.add_argument("--warmup_ratio", type=float, default=None, help="Warmup ratio as fraction of total steps")
-    p.add_argument("--grad_accumulation", type=int, default=None, help="Gradient accumulation steps")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
@@ -122,9 +98,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
-
-    p.add_argument("--ddp", action="store_true", help="Enable DistributedDataParallel")
-    p.add_argument("--local_rank", type=int, default=0)
 
     return p.parse_args()
 
@@ -220,20 +193,7 @@ def _fmt_duration(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
-def _build_scheduler(optimizer, warmup_epochs, total_epochs, warmup_ratio=0.06):
-    """Cosine warmup scheduler with configurable warmup ratio."""
-    if warmup_ratio > 0 and warmup_epochs <= 0:
-        warmup_steps = int(total_epochs * warmup_ratio)
-        if warmup_steps > 0:
-            warmup = torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_steps
-            )
-            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_epochs - warmup_steps, eta_min=1e-6
-            )
-            return torch.optim.lr_scheduler.SequentialLR(
-                optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
-            )
+def _build_scheduler(optimizer, warmup_epochs, total_epochs):
     if warmup_epochs > 0:
         warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_epochs
@@ -370,15 +330,6 @@ def train_one_epoch_grouped(
     best_metric: float = -1.0,
     label_smoothing: float = 0.0,
     feature_noise_std: float = 0.0,
-    grad_accumulation: int = 1,
-    use_combined_loss: bool = True,
-    gamma_neg: float = 2.0,
-    gamma_pos: float = 0.0,
-    clip: float = 0.05,
-    soft_f1_weight: float = 0.3,
-    use_corn_loss: bool = True,
-    use_qwk_aux: bool = True,
-    qwk_weight: float = 0.3,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -390,9 +341,7 @@ def train_one_epoch_grouped(
         desc += f" [best={best_metric:.4f}]"
     pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
 
-    optimizer.zero_grad(set_to_none=True)
-
-    for step, batch in enumerate(pbar):
+    for batch in pbar:
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         session_types = batch["session_types"].to(device)
@@ -411,49 +360,26 @@ def train_one_epoch_grouped(
         else:
             targets = batch["participant_y_a2"].to(device).long()
 
-        is_sync = (step + 1) % grad_accumulation == 0
-
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
             p_logits = task_head(out["participant_repr"])
-
             if task == "a1":
-                main_loss = a1_loss(
-                    p_logits, targets, pos_weight=pos_weight,
-                    label_smoothing=label_smoothing,
-                    use_combined=use_combined_loss,
-                    gamma_neg=gamma_neg, gamma_pos=gamma_pos,
-                    clip=clip, soft_f1_weight=soft_f1_weight,
-                )
+                main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
             else:
-                main_loss = a2_ordinal_loss(
-                    p_logits, targets, pos_weight=pos_weight,
-                    label_smoothing=label_smoothing,
-                    use_corn=use_corn_loss, use_qwk=use_qwk_aux,
-                    qwk_weight=qwk_weight,
-                )
+                main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
 
             if has_valid_sessions:
                 s_logits = task_head(out["session_reprs"])[valid_session_mask]
                 if task == "a1":
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
-                    sess_loss = a1_loss(
-                        s_logits, s_targets, pos_weight=pos_weight,
-                        label_smoothing=label_smoothing,
-                        use_combined=use_combined_loss,
-                        gamma_neg=gamma_neg, gamma_pos=gamma_pos,
-                        clip=clip, soft_f1_weight=soft_f1_weight,
-                    )
+                    sess_loss = a1_loss(s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
                 else:
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
                     sess_loss = a2_ordinal_loss(
-                        s_logits, s_targets, pos_weight=pos_weight,
-                        label_smoothing=label_smoothing,
-                        use_corn=use_corn_loss, use_qwk=use_qwk_aux,
-                        qwk_weight=qwk_weight,
+                        s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing
                     )
 
                 type_loss = F.cross_entropy(
@@ -465,33 +391,28 @@ def train_one_epoch_grouped(
                 type_loss = p_logits.new_zeros(())
 
             loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
-            loss = loss / grad_accumulation
 
+        optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(
+                list(grouped_model.parameters()) + list(task_head.parameters()),
+                max_norm=grad_clip,
+            )
+            scaler.step(optimizer)
+            scaler.update()
         else:
             loss.backward()
+            nn.utils.clip_grad_norm_(
+                list(grouped_model.parameters()) + list(task_head.parameters()),
+                max_norm=grad_clip,
+            )
+            optimizer.step()
 
-        if is_sync:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(
-                    list(grouped_model.parameters()) + list(task_head.parameters()),
-                    max_norm=grad_clip,
-                )
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                nn.utils.clip_grad_norm_(
-                    list(grouped_model.parameters()) + list(task_head.parameters()),
-                    max_norm=grad_clip,
-                )
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-
-        total_loss += loss.item() * grad_accumulation
+        total_loss += loss.item()
         n_batches += 1
-        pbar.set_postfix_str(f"{loss.item() * grad_accumulation:.4f}")
+        pbar.set_postfix_str(f"{loss.item():.4f}")
 
     pbar.close()
     return total_loss / max(n_batches, 1)
@@ -916,60 +837,33 @@ def main() -> None:
         audio_pooled_group_dims=audio_pooled_group_dims,
         video_group_dims=video_group_dims,
         d_adapter=cfg.get("d_adapter", 64),
-        d_model=cfg.get("d_model", 512),
+        d_model=cfg.get("d_model", 256),
         tcn_layers=cfg.get("tcn_layers", 6),
         tcn_kernel_size=cfg.get("tcn_kernel_size", 3),
         asp_alpha=cfg.get("asp_alpha", 0.5),
         asp_beta=cfg.get("asp_beta", 0.5),
         dropout=cfg.get("dropout", 0.2),
-        d_shared=cfg.get("d_shared", 512),
-        use_hierarchical_encoder=cfg.get("use_hierarchical_encoder", True),
-        n_unimodal_layers=cfg.get("n_unimodal_layers", 4),
-        n_fusion_layers=cfg.get("n_fusion_layers", 2),
-        n_bottleneck_tokens=cfg.get("n_bottleneck_tokens", 4),
-        n_perceiver_queries=cfg.get("n_perceiver_queries", 32),
-        temporal_stride=cfg.get("temporal_stride", 4),
+        d_shared=cfg.get("d_shared", 256),
     )
 
     backbone = MTCNBackbone(bb_cfg)
-    use_attention_aggregator = cfg.get("aggregator", "attention") == "attention"
     grouped_model = GroupedModel(
         backbone=backbone,
         d_shared=bb_cfg.d_shared,
-        aggregator_method=cfg.get("aggregator", "attention"),
+        aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
-        use_session_conditioning=True,
     ).to(device)
 
     use_coral = bool(cfg.get("use_coral", False))
     if task == "a1":
         bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
-        use_combined_loss = cfg.get("use_combined_loss", True)
-        task_head = A1Head(
-            bb_cfg.d_shared, bias_init=bias_init,
-            use_combined_loss=use_combined_loss,
-            gamma_neg=cfg.get("gamma_neg", 2),
-            gamma_pos=cfg.get("gamma_pos", 0),
-            clip=cfg.get("asl_clip", 0.05),
-            soft_f1_weight=cfg.get("soft_f1_weight", 0.3),
-            label_smoothing=cfg.get("label_smoothing", 0.1),
-        ).to(device)
-        log.info(f"Using ASL+SoftF1 combined loss for A1")
+        task_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
     else:
-        use_corn = cfg.get("use_corn_loss", True)
-        use_qwk = cfg.get("use_qwk_aux", True)
         if use_coral:
             task_head = CORALHead(bb_cfg.d_shared).to(device)
             log.info("Using CORAL head for A2")
         else:
-            task_head = A2OrdinalHead(
-                bb_cfg.d_shared,
-                use_corn_loss=use_corn,
-                use_qwk_aux=use_qwk,
-                qwk_weight=cfg.get("qwk_weight", 0.3),
-                label_smoothing=cfg.get("label_smoothing", 0.1),
-            ).to(device)
-        log.info(f"A2 loss: CORN={use_corn}, QWK_aux={use_qwk}")
+            task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
 
     n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
     log.info(f"Model params: {n_params:,}")
@@ -980,7 +874,6 @@ def main() -> None:
         log.info("AMP enabled (BF16)")
 
     grad_clip = cfg.get("grad_clip", 1.0)
-    grad_accumulation = cfg.get("grad_accumulation", 1)
     pos_weight_t = None
     if cfg.get("use_pos_weight", True):
         if task == "a1":
@@ -991,21 +884,14 @@ def main() -> None:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
-    if grad_accumulation > 1:
-        effective_batch = batch_size * grad_accumulation
-        log.info(f"Gradient accumulation: {grad_accumulation}, effective batch size: {effective_batch}")
-
     params = list(grouped_model.parameters()) + list(task_head.parameters())
-    lr = cfg.get("lr", 3e-5)
     optimizer = torch.optim.AdamW(
-        params, lr=lr, weight_decay=cfg.get("weight_decay", 1e-2)
+        params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
-    epochs = cfg.get("epochs", 30)
+    epochs = cfg.get("epochs", 20)
     warmup_epochs = cfg.get("warmup_epochs", 3)
-    warmup_ratio = cfg.get("warmup_ratio", 0.06)
-    scheduler = _build_scheduler(optimizer, warmup_epochs, epochs, warmup_ratio)
-    log.info(f"Scheduler: warmup_ratio={warmup_ratio}, warmup_epochs={warmup_epochs}, cosine, total={epochs}")
-    log.info(f"Learning rate: {lr}")
+    scheduler = _build_scheduler(optimizer, warmup_epochs, epochs)
+    log.info(f"Scheduler: warmup={warmup_epochs} -> cosine, total={epochs}")
     log.info(f"Grad clip: {grad_clip}")
 
     session_loss_weight = cfg.get("session_loss_weight", 0.5)
@@ -1040,10 +926,6 @@ def main() -> None:
     for epoch in range(1, epochs + 1):
         t0 = time.time()
 
-        use_combined_loss = cfg.get("use_combined_loss", True)
-        use_corn_loss = cfg.get("use_corn_loss", True)
-        use_qwk_aux = cfg.get("use_qwk_aux", True)
-
         train_loss = train_one_epoch_grouped(
             grouped_model, task_head, train_loader, optimizer, device,
             task, epoch, epochs, scaler, use_amp,
@@ -1053,15 +935,6 @@ def main() -> None:
             best_metric=best_metric,
             label_smoothing=label_smoothing,
             feature_noise_std=feature_noise_std,
-            grad_accumulation=grad_accumulation,
-            use_combined_loss=use_combined_loss,
-            gamma_neg=cfg.get("gamma_neg", 2.0),
-            gamma_pos=cfg.get("gamma_pos", 0.0),
-            clip=cfg.get("asl_clip", 0.05),
-            soft_f1_weight=cfg.get("soft_f1_weight", 0.3),
-            use_corn_loss=use_corn_loss,
-            use_qwk_aux=use_qwk_aux,
-            qwk_weight=cfg.get("qwk_weight", 0.3),
         )
 
         val_metrics = validate_grouped(
