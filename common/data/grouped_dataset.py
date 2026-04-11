@@ -20,12 +20,20 @@ log = logging.getLogger(__name__)
 
 
 class GroupedParticipantDataset(Dataset):
+    """
+    按参与者分组的数据集，每个样本包含一个人的所有会话（最多4个）
+
+    核心：
+    1. 纵向建模：捕捉同一个体在不同时间点的心理状态变化
+    2. 会话dropout：训练时随机丢弃会话，防止过拟合特定测试时间点
+    3. 标签共享：同一参与者的所有会话共享相同的DASS-21标签
+    """
     def __init__(
         self,
         manifest_path: str | Path,
         cfg: FeatureConfig,
         split: str,
-        session_drop_prob: float = 0.0,
+        session_drop_prob: float = 0.0,  # 训练时随机丢弃会话的概率，用于数据增强
     ) -> None:
         self.cfg = cfg
         self.split = split
@@ -34,25 +42,28 @@ class GroupedParticipantDataset(Dataset):
 
         manifest = pd.read_csv(manifest_path)
 
+        # 按(学校, 班级, 学生ID)分组，将同一个人的多次测试聚合在一起
         group_cols = ["anon_school", "anon_class", "anon_pid"]
         grouped = manifest.groupby(group_cols)
 
         self.participants: list[dict[str, Any]] = []
         for (school, cls, pid), group in grouped:
+            # 构建会话字典：{"A01": row1, "B01": row2, ...}
             sess_rows = {}
             for _, row in group.iterrows():
                 sess = str(row["session"])
                 sess_rows[sess] = row
 
+            # 提取标签（同一参与者的所有会话标签相同，取任意一行即可）
             any_row = group.iloc[0]
-            y_a1 = np.array([float(any_row.get(c, -1)) for c in A1_COLS], dtype=np.float32)
-            y_a2 = np.array([float(any_row.get(c, -1)) for c in ITEM_COLS], dtype=np.float32)
+            y_a1 = np.array([float(any_row.get(c, -1)) for c in A1_COLS], dtype=np.float32)  # 维度级标签：[y_D, y_A, y_S]
+            y_a2 = np.array([float(any_row.get(c, -1)) for c in ITEM_COLS], dtype=np.float32)  # 题目级标签：[d01-d21]
 
             self.participants.append({
                 "anon_school": str(school),
                 "anon_class": str(cls),
                 "anon_pid": str(pid),
-                "sess_rows": sess_rows,
+                "sess_rows": sess_rows,  # 该参与者的所有会话元信息
                 "y_a1": y_a1,
                 "y_a2": y_a2,
             })
@@ -86,6 +97,7 @@ class GroupedParticipantDataset(Dataset):
                 dims["egemaps"] = len(eg)
         return dims
 
+    # 加载原始特征组，返回一个字典，键是特征名，值是SequenceData对象
     def _load_raw_groups(self, row, modality: str) -> dict[str, SequenceData]:
         cfg = self.cfg
         feat_list = cfg.audio_sequence_features if modality == "audio" else cfg.video_features
@@ -109,6 +121,7 @@ class GroupedParticipantDataset(Dataset):
                 pass
         return groups
 
+    # 计算模态掩码的核心函数，根据多个特征的掩码和策略合成一个模态级掩码
     def _compute_modality_mask(
         self, mask_parts, mask_names, core_names, policy, T
     ) -> np.ndarray:
@@ -128,12 +141,23 @@ class GroupedParticipantDataset(Dataset):
         raise ValueError(f"Unknown mask_policy: {policy!r}")
 
     def _load_single_session(self, row) -> dict[str, Any] | None:
-        """Load features for a single session. Returns None on failure."""
+        """
+        加载单个会话的特征数据
+
+        返回：
+            成功时返回包含特征和掩码的字典，失败时返回None
+
+        设计要点：
+        - 与dataset.py的_load_sample逻辑相同，但不包含标签（标签在参与者级别）
+        - 返回None而非抛出异常，允许部分会话缺失（如某次测试设备故障）
+        """
         cfg = self.cfg
         try:
+            # 步骤1：加载原始特征
             audio_raw = self._load_raw_groups(row, "audio")
             video_raw = self._load_raw_groups(row, "video")
 
+            # 合并为统一字典，键名加上模态前缀
             all_groups = {}
             for k, v in audio_raw.items():
                 all_groups[f"audio/{k}"] = v
@@ -141,8 +165,9 @@ class GroupedParticipantDataset(Dataset):
                 all_groups[f"video/{k}"] = v
 
             if not all_groups:
-                return None
+                return None  # 无任何特征时返回None，而非抛出异常
 
+            # 步骤2：时间对齐到统一网格
             aligned_feats, aligned_masks, grid_ms, T = align_to_grid(
                 all_groups, cfg.grid_step_ms, cfg.tolerance_ms
             )
@@ -152,6 +177,7 @@ class GroupedParticipantDataset(Dataset):
             audio_mask_parts, audio_mask_names = [], []
             video_mask_parts, video_mask_names = [], []
 
+            # 步骤3：分离音频和视频特征，收集掩码
             for key, feat in aligned_feats.items():
                 modality, name = key.split("/", 1)
                 mask = aligned_masks[key]
@@ -165,6 +191,7 @@ class GroupedParticipantDataset(Dataset):
                     video_mask_parts.append(mask)
                     video_mask_names.append(name)
 
+            # 步骤4：根据策略计算模态级掩码
             mask_audio = self._compute_modality_mask(
                 audio_mask_parts, audio_mask_names, cfg.core_audio, cfg.mask_policy, T
             )
@@ -172,6 +199,7 @@ class GroupedParticipantDataset(Dataset):
                 video_mask_parts, video_mask_names, cfg.core_video, cfg.mask_policy, T
             )
 
+            # 步骤5：提取VAD信号（语音活动检测）
             vad_signal = np.zeros(T, dtype=np.float32)
             if "audio/vad" in aligned_feats:
                 v = aligned_feats["audio/vad"]
@@ -180,11 +208,13 @@ class GroupedParticipantDataset(Dataset):
                 v = aligned_feats["video/vad_agg"]
                 vad_signal = v[:, 0].astype(np.float32) * aligned_masks["video/vad_agg"].astype(np.float32)
 
+            # 步骤6：提取质量分数
             qc_quality = np.zeros(T, dtype=np.float32)
             if "video/qc_stats" in aligned_feats:
                 v = aligned_feats["video/qc_stats"]
                 qc_quality = v[:, 0].astype(np.float32) * aligned_masks["video/qc_stats"].astype(np.float32)
 
+            # 步骤7：加载池化特征（egemaps）
             dims = self.feature_dims
             audio_pooled_groups: dict[str, torch.Tensor] = {}
             pooled_presence: dict[str, bool] = {}
@@ -200,6 +230,7 @@ class GroupedParticipantDataset(Dataset):
                 )
                 pooled_presence["egemaps"] = egemaps is not None
 
+            # 步骤8：零填充缺失特征（确保所有会话特征集一致）
             for name in cfg.audio_features:
                 if name not in audio_groups and name not in cfg.audio_pooled_features and name in dims:
                     audio_groups[name] = torch.zeros(T, dims[name])
@@ -224,27 +255,44 @@ class GroupedParticipantDataset(Dataset):
             }
         except Exception as e:
             log.debug(f"Failed to load session {row.get('session', '?')} for {row.get('anon_pid', '?')}: {e}")
-            return None
+            return None  # 静默失败，允许部分会话缺失
 
     def __len__(self) -> int:
         return len(self.participants)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        """
+        获取单个参与者的数据
+
+        返回字典包含：
+        - sessions: 长度为4的列表，每个元素是一个会话的特征字典（或None）
+        - session_valid: 布尔数组，标记哪些会话有效
+        - y_a1, y_a2: 该参与者的标签（所有会话共享）
+        """
         if self._cache is not None and self._cache[idx] is not None:
             sample = self._cache[idx]
         else:
             sample = self._load_participant(idx)
 
+        # 训练时应用会话dropout进行数据增强
         if self.split == "train" and self.session_drop_prob > 0.0:
             return self._apply_session_dropout(sample)
         return sample
 
     def _load_participant(self, idx: int) -> dict[str, Any]:
+        """
+        加载一个参与者的所有会话
+
+        关键设计：
+        - 按固定顺序[A01, B01, B02, B03]组织会话，保持批次内结构一致
+        - 缺失的会话用None占位，通过session_valid标记
+        """
         info = self.participants[idx]
         sessions_data = []
         session_valid = []
 
-        for sess_name in SESSIONS:
+        # 按固定顺序遍历所有可能的会话
+        for sess_name in SESSIONS:  # ["A01", "B01", "B02", "B03"]
             if sess_name in info["sess_rows"]:
                 data = self._load_single_session(info["sess_rows"][sess_name])
                 if data is not None:
@@ -258,8 +306,8 @@ class GroupedParticipantDataset(Dataset):
                 session_valid.append(False)
 
         return {
-            "sessions": sessions_data,
-            "session_valid": np.array(session_valid, dtype=bool),
+            "sessions": sessions_data,  # 长度为4的列表，元素为会话字典或None
+            "session_valid": np.array(session_valid, dtype=bool),  # [True, True, False, True]表示第3个会话缺失
             "y_a1": torch.from_numpy(info["y_a1"]),
             "y_a2": torch.from_numpy(info["y_a2"]),
             "anon_pid": info["anon_pid"],
@@ -269,13 +317,25 @@ class GroupedParticipantDataset(Dataset):
         }
 
     def _apply_session_dropout(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """
+        训练时随机丢弃一个会话，用于数据增强
+
+        动机：
+        - 防止模型过拟合特定测试时间点（如总是依赖B03的数据）
+        - 提高模型对缺失会话的鲁棒性（测试时某些会话可能不可用）
+
+        策略：
+        - 只在有2个及以上有效会话时才dropout（保证至少有1个会话）
+        - 以session_drop_prob概率触发
+        """
         valid_indices = [
             idx for idx, is_valid in enumerate(sample["session_valid"].tolist())
             if is_valid and sample["sessions"][idx] is not None
         ]
         if len(valid_indices) <= 1 or np.random.random() >= self.session_drop_prob:
-            return sample
+            return sample  # 不满足dropout条件，直接返回
 
+        # 随机选择一个有效会话进行丢弃
         drop_idx = int(np.random.choice(valid_indices))
         sessions = list(sample["sessions"])
         sessions[drop_idx] = None
@@ -332,29 +392,50 @@ class GroupedParticipantDataset(Dataset):
 
 
 def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    B = len(batch)
-    all_sessions = []  
-    session_types = [] 
-    session_valid_list = []
-    flat_pids = []
-    flat_sess_names = []
+    """
+    批处理函数：将多个参与者的数据打包成批次
 
-    for b_idx, sample in enumerate(batch):
+    核心挑战：
+    1. 每个参与者有不同数量的有效会话（1-4个）
+    2. 每个会话的序列长度不同
+
+    解决方案：
+    1. 将所有会话"展平"成一维列表（flat_batch）
+    2. 通过session_types和session_valid追踪每个会话属于哪个参与者
+    3. 缺失的会话用dummy填充，保持结构一致
+
+    示例：
+    输入：2个参与者
+    - P1: [A01✓, B01✓, B02✗, B03✓]  (3个有效会话)
+    - P2: [A01✓, B01✗, B02✓, B03✓]  (3个有效会话)
+
+    输出：flat_batch包含8个会话（6个真实+2个dummy）
+    """
+    B = len(batch)
+    all_sessions = []  # 展平后的所有会话数据
+    session_types = []  # 每个会话的类型索引：0=A01, 1=B01, 2=B02, 3=B03
+    session_valid_list = []
+    flat_pids = []  # 每个会话对应的参与者ID
+    flat_sess_names = []  # 每个会话的名称
+
+    for sample in batch:
         session_valid_list.append(sample["session_valid"])
         for s_idx, sess_data in enumerate(sample["sessions"]):
             if sess_data is not None:
+                # 有效会话：直接添加
                 all_sessions.append(sess_data)
                 session_types.append(s_idx)
                 flat_pids.append(sample["anon_pid"])
                 flat_sess_names.append(SESSIONS[s_idx])
             else:
-                dims = batch[0]["sessions"]
+                # 缺失会话：创建dummy占位
+                # 步骤1：寻找参考会话（用于获取特征维度）
                 ref = None
-                for s in sample["sessions"]:
+                for s in sample["sessions"]:  # 优先从当前参与者找
                     if s is not None:
                         ref = s
                         break
-                if ref is None:
+                if ref is None:  # 当前参与者所有会话都缺失，从其他参与者找
                     for other in batch:
                         for s in other["sessions"]:
                             if s is not None:
@@ -373,6 +454,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     if not all_sessions:
         raise RuntimeError("No valid sessions in batch")
 
+    # 展平后的批次大小和最大序列长度
     n_flat = len(all_sessions)
     T_max = max(s["seq_len"] for s in all_sessions)
 
@@ -381,6 +463,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     video_names = list(all_sessions[0]["video_groups"].keys())
 
     def _pad_groups(names, key):
+        """填充序列特征组到(n_flat, T_max, D)"""
         result = {}
         for n in names:
             D = all_sessions[0][key][n].shape[-1]
@@ -392,16 +475,19 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         return result
 
     def _pad_1d(key, dtype=torch.float32):
+        """填充一维序列到(n_flat, T_max)"""
         t = torch.zeros(n_flat, T_max, dtype=dtype)
         for i, s in enumerate(all_sessions):
             L = s["seq_len"]
             t[i, :L] = s[key]
         return t
 
+    # 生成填充掩码
     pad_mask = torch.ones(n_flat, T_max, dtype=torch.bool)
     for i, s in enumerate(all_sessions):
         pad_mask[i, :s["seq_len"]] = False
 
+    # 构建展平批次（所有会话作为独立样本）
     flat_batch = {
         "audio_groups": _pad_groups(audio_names, "audio_groups"),
         "audio_pooled_groups": {
@@ -427,24 +513,38 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "session": flat_sess_names,
     }
 
+    # 返回两层结构：flat_batch（会话级）+ participant级元信息
     return {
-        "flat_batch": flat_batch,
-        "participant_y_a1": torch.stack([b["y_a1"] for b in batch]),
-        "participant_y_a2": torch.stack([b["y_a2"] for b in batch]),
-        "session_valid": torch.from_numpy(np.stack(session_valid_list)),
-        "session_types": torch.tensor(session_types, dtype=torch.long),
-        "n_participants": B,
+        "flat_batch": flat_batch,  # 展平的会话数据，形状(n_flat, ...)
+        "participant_y_a1": torch.stack([b["y_a1"] for b in batch]),  # 参与者级标签，形状(B, 3)
+        "participant_y_a2": torch.stack([b["y_a2"] for b in batch]),  # 形状(B, 21)
+        "session_valid": torch.from_numpy(np.stack(session_valid_list)),  # 形状(B, 4)，标记每个参与者的哪些会话有效
+        "session_types": torch.tensor(session_types, dtype=torch.long),  # 形状(n_flat,)，每个会话的类型索引
+        "n_participants": B,  # 批次中的参与者数量
         "anon_pids": [b["anon_pid"] for b in batch],
         "anon_schools": [b["anon_school"] for b in batch],
         "anon_classes": [b["anon_class"] for b in batch],
-        "flat_sessions": flat_sess_names,
-        "flat_pids": flat_pids,
+        "flat_sessions": flat_sess_names,  # 展平后的会话名称列表
+        "flat_pids": flat_pids,  # 展平后的参与者ID列表
     }
 
 
 def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
-    """Create a zero-filled dummy session matching reference dims."""
-    T = 1  # minimal length
+    """
+    创建零填充的dummy会话，用于占位缺失的会话
+
+    参数：
+        ref: 参考会话，用于获取特征维度和结构
+
+    返回：
+        与ref结构相同但数值全为零的dummy会话
+
+    设计要点：
+    - 序列长度设为1（最小长度），节省内存
+    - 所有掩码为False，标记为无效数据
+    - 模型通过session_valid识别dummy，不参与损失计算
+    """
+    T = 1  # 最小序列长度
     audio_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["audio_groups"].items()}
     video_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["video_groups"].items()}
     return {
@@ -453,14 +553,14 @@ def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
             k: torch.zeros_like(v) for k, v in ref["audio_pooled_groups"].items()
         },
         "video_groups": video_groups,
-        "mask_audio": torch.zeros(T, dtype=torch.bool),
+        "mask_audio": torch.zeros(T, dtype=torch.bool),  # 全False，标记为无效
         "mask_video": torch.zeros(T, dtype=torch.bool),
         "vad_signal": torch.zeros(T),
         "qc_quality": torch.zeros(T),
         "audio_pooled_present": {
             k: False for k in ref["audio_pooled_groups"].keys()
         },
-        "session_idx": 0,
+        "session_idx": 0,  # 默认为A01
         "seq_len": T,
         "session": "A01",
     }
