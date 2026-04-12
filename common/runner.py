@@ -75,6 +75,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--session_type_loss_weight", type=float, default=None)
     p.add_argument("--use_coral", type=int, default=None, help="1=use CORAL head for A2")
 
+    # 损失函数增强参数
+    p.add_argument("--use_combined_loss", type=int, default=None, help="1=use ASL+Soft-F1 for A1")
+    p.add_argument("--gamma_neg", type=float, default=None, help="ASL negative focusing parameter")
+    p.add_argument("--gamma_pos", type=float, default=None, help="ASL positive focusing parameter")
+    p.add_argument("--clip", type=float, default=None, help="ASL probability clipping threshold")
+    p.add_argument("--soft_f1_weight", type=float, default=None, help="Soft-F1 loss weight in A1")
+
+    p.add_argument("--use_corn_loss", type=int, default=None, help="1=use CORN loss for A2")
+    p.add_argument("--use_qwk_aux", type=int, default=None, help="1=use differentiable QWK auxiliary loss for A2")
+    p.add_argument("--qwk_weight", type=float, default=None, help="QWK auxiliary loss weight for A2")
+
     p.add_argument("--submission_level", type=str, default=None,
                     choices=["session", "participant"], help="Use participant-level preds for submission")
     p.add_argument("--decode_method", type=str, default=None,
@@ -330,6 +341,16 @@ def train_one_epoch_grouped(
     best_metric: float = -1.0,
     label_smoothing: float = 0.0,
     feature_noise_std: float = 0.0,
+    # A1 损失函数参数
+    use_combined_loss: bool = False,
+    gamma_neg: float = 2.0,
+    gamma_pos: float = 0.0,
+    clip: float = 0.05,
+    soft_f1_weight: float = 0.3,
+    # A2 损失函数参数
+    use_corn_loss: bool = False,
+    use_qwk_aux: bool = False,
+    qwk_weight: float = 0.3,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -367,19 +388,49 @@ def train_one_epoch_grouped(
 
             p_logits = task_head(out["participant_repr"])
             if task == "a1":
-                main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                main_loss = a1_loss(
+                    p_logits, targets,
+                    pos_weight=pos_weight,
+                    label_smoothing=label_smoothing,
+                    use_combined=use_combined_loss,
+                    gamma_neg=gamma_neg,
+                    gamma_pos=gamma_pos,
+                    clip=clip,
+                    soft_f1_weight=soft_f1_weight,
+                )
             else:
-                main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                main_loss = a2_ordinal_loss(
+                    p_logits, targets,
+                    pos_weight=pos_weight,
+                    label_smoothing=label_smoothing,
+                    use_corn=use_corn_loss,
+                    use_qwk=use_qwk_aux,
+                    qwk_weight=qwk_weight,
+                )
 
             if has_valid_sessions:
                 s_logits = task_head(out["session_reprs"])[valid_session_mask]
                 if task == "a1":
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
-                    sess_loss = a1_loss(s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                    sess_loss = a1_loss(
+                        s_logits, s_targets,
+                        pos_weight=pos_weight,
+                        label_smoothing=label_smoothing,
+                        use_combined=use_combined_loss,
+                        gamma_neg=gamma_neg,
+                        gamma_pos=gamma_pos,
+                        clip=clip,
+                        soft_f1_weight=soft_f1_weight,
+                    )
                 else:
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
                     sess_loss = a2_ordinal_loss(
-                        s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing
+                        s_logits, s_targets,
+                        pos_weight=pos_weight,
+                        label_smoothing=label_smoothing,
+                        use_corn=use_corn_loss,
+                        use_qwk=use_qwk_aux,
+                        qwk_weight=qwk_weight,
                     )
 
                 type_loss = F.cross_entropy(

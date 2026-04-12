@@ -54,3 +54,7 @@ label_smoothing: 0.05
 feature_noise_std: 0.01
 session_drop_prob: 0.1
 early_stop_metric: val_loss
+
+use_corn_loss: 1
+use_qwk_aux: 1
+qwk_weight: 0.3
