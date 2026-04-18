@@ -97,6 +97,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early_stop_metric", type=str, default=None,
                     choices=["primary", "val_loss"], help="Metric for early stopping")
 
+    # 辅助属性参数
+    p.add_argument("--use_aux_attrs", type=int, default=None, help="1=use auxiliary attributes")
+    p.add_argument("--aux_embed_dim", type=int, default=None, help="Embedding dimension for each auxiliary attribute")
+
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
@@ -381,8 +385,13 @@ def train_one_epoch_grouped(
         else:
             targets = batch["participant_y_a2"].to(device).long()
 
+        # 获取辅助属性（如果存在）
+        aux_attrs = batch.get("participant_aux_attrs")
+        if aux_attrs is not None:
+            aux_attrs = aux_attrs.to(device)
+
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid, aux_attrs)
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
@@ -503,8 +512,13 @@ def validate_grouped(
         else:
             targets = batch["participant_y_a2"].to(device).long()
 
+        # 获取辅助属性（如果存在）
+        aux_attrs = batch.get("participant_aux_attrs")
+        if aux_attrs is not None:
+            aux_attrs = aux_attrs.to(device)
+
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid, aux_attrs)
             p_logits = task_head(out["participant_repr"])
             if task == "a1":
                 loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
@@ -662,8 +676,13 @@ def generate_submission_grouped(
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
 
+        # 获取辅助属性（如果存在）
+        aux_attrs = batch.get("participant_aux_attrs")
+        if aux_attrs is not None:
+            aux_attrs = aux_attrs.to(device)
+
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid, aux_attrs)
 
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"])
@@ -705,8 +724,12 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
+        # 获取辅助属性（如果存在）
+        aux_attrs = batch.get("participant_aux_attrs")
+        if aux_attrs is not None:
+            aux_attrs = aux_attrs.to(device)
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid, aux_attrs)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a1"].numpy()
@@ -732,8 +755,12 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
+        # 获取辅助属性（如果存在）
+        aux_attrs = batch.get("participant_aux_attrs")
+        if aux_attrs is not None:
+            aux_attrs = aux_attrs.to(device)
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid, aux_attrs)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a2"].numpy()
@@ -898,23 +925,38 @@ def main() -> None:
     )
 
     backbone = MTCNBackbone(bb_cfg)
+
+    # 创建辅助属性编码器（如果启用）
+    aux_encoder = None
+    aux_dim = 0
+    use_aux_attrs = bool(cfg.get("use_aux_attrs", False))
+    if use_aux_attrs:
+        from .models.aux_encoder import AuxiliaryAttributeEncoder
+        aux_embed_dim = cfg.get("aux_embed_dim", 8)
+        aux_encoder = AuxiliaryAttributeEncoder(embed_dim=aux_embed_dim, dropout=cfg.get("dropout", 0.2))
+        aux_dim = aux_encoder.output_dim
+        log.info(f"Auxiliary attributes enabled: embed_dim={aux_embed_dim}, output_dim={aux_dim}")
+
     grouped_model = GroupedModel(
         backbone=backbone,
         d_shared=bb_cfg.d_shared,
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
+        aux_encoder=aux_encoder,
     ).to(device)
 
     use_coral = bool(cfg.get("use_coral", False))
+    # 任务头的输入维度 = d_shared + aux_dim
+    task_head_input_dim = bb_cfg.d_shared + aux_dim
     if task == "a1":
         bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
-        task_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
+        task_head = A1Head(task_head_input_dim, bias_init=bias_init).to(device)
     else:
         if use_coral:
-            task_head = CORALHead(bb_cfg.d_shared).to(device)
+            task_head = CORALHead(task_head_input_dim).to(device)
             log.info("Using CORAL head for A2")
         else:
-            task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+            task_head = A2OrdinalHead(task_head_input_dim).to(device)
 
     n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
     log.info(f"Model params: {n_params:,}")

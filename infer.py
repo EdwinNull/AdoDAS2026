@@ -137,15 +137,27 @@ def main() -> None:
         d_shared=bb_cfg.d_shared,
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
+        aux_encoder=None,  # 推理时从checkpoint加载
     ).to(device)
 
+    # 计算任务头输入维度
+    aux_dim = 0
+    use_aux_attrs = bool(cfg.get("use_aux_attrs", False))
+    if use_aux_attrs:
+        from common.models.aux_encoder import AuxiliaryAttributeEncoder
+        aux_embed_dim = cfg.get("aux_embed_dim", 8)
+        aux_encoder = AuxiliaryAttributeEncoder(embed_dim=aux_embed_dim, dropout=cfg.get("dropout", 0.2))
+        grouped_model.aux_encoder = aux_encoder.to(device)
+        aux_dim = aux_encoder.output_dim
+
+    task_head_input_dim = bb_cfg.d_shared + aux_dim
     if args.task == "a1":
-        task_head = A1Head(bb_cfg.d_shared).to(device)
+        task_head = A1Head(task_head_input_dim).to(device)
     else:
         if bool(cfg.get("use_coral", False)):
-            task_head = CORALHead(bb_cfg.d_shared).to(device)
+            task_head = CORALHead(task_head_input_dim).to(device)
         else:
-            task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+            task_head = A2OrdinalHead(task_head_input_dim).to(device)
 
     state = load_checkpoint(checkpoint_path, grouped_model, optimizer=None)
     task_head.load_state_dict(state["head_state_dict"])

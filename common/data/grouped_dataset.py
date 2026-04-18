@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from .dataset import (
-    SESSIONS, SESSION_TO_IDX, ITEM_COLS, A1_COLS,
+    SESSIONS, SESSION_TO_IDX, ITEM_COLS, A1_COLS, AUX_ATTR_COLS,
     FeatureConfig, align_to_grid,
 )
 from .feature_io import SequenceData, load_egemaps_pooled, load_sequence
@@ -59,6 +59,9 @@ class GroupedParticipantDataset(Dataset):
             y_a1 = np.array([float(any_row.get(c, -1)) for c in A1_COLS], dtype=np.float32)  # 维度级标签：[y_D, y_A, y_S]
             y_a2 = np.array([float(any_row.get(c, -1)) for c in ITEM_COLS], dtype=np.float32)  # 题目级标签：[d01-d21]
 
+            # 提取辅助属性（同一参与者的所有会话共享相同的辅助属性）
+            aux_attrs = np.array([float(any_row.get(c, -1)) for c in AUX_ATTR_COLS], dtype=np.float32)
+
             self.participants.append({
                 "anon_school": str(school),
                 "anon_class": str(cls),
@@ -66,6 +69,7 @@ class GroupedParticipantDataset(Dataset):
                 "sess_rows": sess_rows,  # 该参与者的所有会话元信息
                 "y_a1": y_a1,
                 "y_a2": y_a2,
+                "aux_attrs": aux_attrs,
             })
 
         self._feature_dims: dict[str, int] | None = None
@@ -310,6 +314,7 @@ class GroupedParticipantDataset(Dataset):
             "session_valid": np.array(session_valid, dtype=bool),  # [True, True, False, True]表示第3个会话缺失
             "y_a1": torch.from_numpy(info["y_a1"]),
             "y_a2": torch.from_numpy(info["y_a2"]),
+            "aux_attrs": torch.from_numpy(info["aux_attrs"]),
             "anon_pid": info["anon_pid"],
             "anon_school": info["anon_school"],
             "anon_class": info["anon_class"],
@@ -518,6 +523,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "flat_batch": flat_batch,  # 展平的会话数据，形状(n_flat, ...)
         "participant_y_a1": torch.stack([b["y_a1"] for b in batch]),  # 参与者级标签，形状(B, 3)
         "participant_y_a2": torch.stack([b["y_a2"] for b in batch]),  # 形状(B, 21)
+        "participant_aux_attrs": torch.stack([b["aux_attrs"] for b in batch]),  # 形状(B, 5)，辅助属性
         "session_valid": torch.from_numpy(np.stack(session_valid_list)),  # 形状(B, 4)，标记每个参与者的哪些会话有效
         "session_types": torch.tensor(session_types, dtype=torch.long),  # 形状(n_flat,)，每个会话的类型索引
         "n_participants": B,  # 批次中的参与者数量

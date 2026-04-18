@@ -156,6 +156,7 @@ class GroupedModel(nn.Module):
         d_shared: int,
         aggregator_method: str = "mlp",
         dropout: float = 0.2,
+        aux_encoder=None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -164,22 +165,25 @@ class GroupedModel(nn.Module):
             method=aggregator_method, dropout=dropout,
         )
         self.session_type_head = SessionTypeClassifier(d_in=d_shared)
+        self.aux_encoder = aux_encoder
 
     def forward(
         self,
         flat_batch: dict,
         n_participants: int,
         session_valid: torch.Tensor,
+        aux_attrs: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         参数:
             flat_batch:     展平的 batch 字典，包含 n_participants×4 个会话的特征
             n_participants: 参与者数量 B
             session_valid:  (B, 4) bool，标记每个参与者的各会话是否有效
+            aux_attrs:      (B, 5) 辅助属性，可选
         返回:
             dict，包含：
                 "session_reprs":      (B×4, d_shared) — 各会话的骨干输出
-                "participant_repr":   (B, d_shared)   — 聚合后的参与者表示
+                "participant_repr":   (B, d_shared + aux_dim)   — 聚合后的参与者表示（可能拼接了辅助属性）
                 "session_type_logits":(B×4, 4)       — 辅助任务预测
         """
         # 骨干网络一次处理所有会话（利用 batch 并行加速）
@@ -192,6 +196,11 @@ class GroupedModel(nn.Module):
 
         # 跨会话聚合：(B, 4, d_shared) + valid_mask → (B, d_shared)
         participant_repr = self.aggregator(session_grid, session_valid)
+
+        # 如果启用辅助属性，编码并拼接到参与者表示
+        if self.aux_encoder is not None and aux_attrs is not None:
+            aux_encoded = self.aux_encoder(aux_attrs)  # (B, aux_dim)
+            participant_repr = torch.cat([participant_repr, aux_encoded], dim=-1)  # (B, d_shared + aux_dim)
 
         # 辅助任务：在单会话粒度预测会话类型（用于多任务学习）
         session_type_logits = self.session_type_head(session_reprs)   # (B×4, 4)

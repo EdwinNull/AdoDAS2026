@@ -20,6 +20,8 @@ SESSIONS = ["A01", "B01", "B02", "B03"]
 SESSION_TO_IDX = {s: i for i, s in enumerate(SESSIONS)}
 ITEM_COLS = [f"d{i:02d}" for i in range(1, 22)]
 A1_COLS = ["y_D", "y_A", "y_S"]
+AUX_ATTR_COLS = ["Family structure", "Only child status", "Parental favoritism",
+                 "Academic performance change", "Emotional state change"]
 POOLED_AUDIO_FEATURES = {"egemaps"}
 
 '''
