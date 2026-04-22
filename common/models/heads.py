@@ -173,23 +173,252 @@ class A2OrdinalHead(nn.Module):
         return targets
 
 
+def asymmetric_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma_neg: float = 2.0,
+    gamma_pos: float = 0.0,
+    clip: float = 0.05,
+    pos_weight: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """
+    非对称损失 (Asymmetric Loss for Multi-Label Classification)
+    参考: Ridnik et al., "Asymmetric Loss For Multi-Label Classification", ICCV 2021
+
+    原理：对正/负样本使用不同的 focusing 参数
+        L_pos = -(1 - p)^γ+ × log(p)         # γ+=0 → 不抑制正样本
+        L_neg = -(p_clip)^γ- × log(1 - p_clip)  # γ-=2 → 强力抑制容易的负样本
+
+    参数:
+        logits:          (B, C) 未经 sigmoid 的预测值
+        targets:         (B, C) 二元标签 {0, 1}
+        gamma_neg:       负样本的 focusing 参数（越大越抑制简单负样本）
+        gamma_pos:       正样本的 focusing 参数（通常为 0，不抑制）
+        clip:            负样本概率截断阈值
+        pos_weight:      正样本权重（可选）
+        label_smoothing: 标签平滑系数
+    """
+    # 标签平滑
+    if label_smoothing > 0.0:
+        targets = targets.float() * (1.0 - label_smoothing) + 0.5 * label_smoothing
+
+    # Sigmoid 概率
+    probs = torch.sigmoid(logits)  # (B, C)
+
+    # 正样本部分
+    pos_probs = probs                             # P(y=1)
+    # 负样本部分（带截断）
+    neg_probs = (probs - clip).clamp(min=0)       # 截断后的概率
+
+    # Focal 调制因子
+    # 正样本：(1-p)^γ+ — γ+=0 时为 1，不调制
+    pos_weight_factor = (1.0 - pos_probs) ** gamma_pos if gamma_pos > 0 else 1.0
+    # 负样本：p^γ- — 概率越高（越"难"）权重越大，概率越低（越"易"）权重越小
+    neg_weight_factor = neg_probs ** gamma_neg
+
+    # 数值稳定的 log
+    eps = 1e-7
+    pos_log = torch.log(pos_probs.clamp(min=eps))
+    neg_log = torch.log((1.0 - neg_probs).clamp(min=eps))
+
+    # 分别计算正/负样本损失
+    loss = -(targets * pos_weight_factor * pos_log +
+             (1 - targets) * neg_weight_factor * neg_log)
+
+    # 可选：正样本加权
+    if pos_weight is not None:
+        loss = loss * torch.where(targets > 0.5, pos_weight, torch.ones_like(pos_weight))
+
+    return loss.mean()
+
+
+def soft_f1_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Soft-F1 损失：直接优化 F1 指标的可微版本
+
+    原理：硬 F1 = 2TP / (2TP + FP + FN) 不可导，
+    Soft-F1 用 sigmoid 概率替代硬判断，使 F1 变为连续可导函数。
+    """
+    probs = torch.sigmoid(logits)
+    targets_f = targets.float()
+
+    # 按类别计算 soft_TP, soft_FP, soft_FN
+    soft_tp = (probs * targets_f).sum(dim=0)         # (C,)
+    soft_fp = (probs * (1.0 - targets_f)).sum(dim=0)  # (C,)
+    soft_fn = ((1.0 - probs) * targets_f).sum(dim=0)  # (C,)
+
+    # Soft-F1 per class
+    eps = 1e-7
+    soft_f1 = (2 * soft_tp) / (2 * soft_tp + soft_fp + soft_fn + eps)  # (C,)
+
+    # Macro-averaged（各类别等权重平均）
+    return 1.0 - soft_f1.mean()
+
+
 def a1_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
+    use_combined: bool = False,
+    gamma_neg: float = 2.0,
+    gamma_pos: float = 0.0,
+    clip: float = 0.05,
+    soft_f1_weight: float = 0.3,
 ) -> torch.Tensor:
     """
-    A1任务损失：带标签平滑的二元交叉熵
+    A1 损失函数（增强版，兼容 runner.py 的调用接口）
 
-    label_smoothing：将硬标签 {0,1} 软化，防止模型过度自信
-        例：smoothing=0.1 → 1→0.95, 0→0.05
-    pos_weight：正样本损失权重，缓解类别不平衡
-        例：负:正=5:1 → pos_weight=5，使正样本梯度×5
+    当 use_combined=False 时，退化为原始 BCE 损失（向后兼容）。
+    当 use_combined=True 时，使用 ASL + Soft-F1 联合损失。
+
+    参数:
+        logits:          (B, C) 预测 logits
+        targets:         (B, C) 二元标签
+        pos_weight:      正样本权重
+        label_smoothing: 标签平滑
+        use_combined:    是否使用联合损失
+        gamma_neg:       ASL 负样本 focusing 参数
+        gamma_pos:       ASL 正样本 focusing 参数
+        clip:            ASL 概率截断阈值
+        soft_f1_weight:  Soft-F1 损失权重
     """
+    if use_combined:
+        asl = asymmetric_loss(
+            logits, targets,
+            gamma_neg=gamma_neg,
+            gamma_pos=gamma_pos,
+            clip=clip,
+            pos_weight=pos_weight,
+            label_smoothing=label_smoothing,
+        )
+        sf1 = soft_f1_loss(logits, targets)
+        return asl + soft_f1_weight * sf1
+
+    # 原始 BCE 损失（向后兼容）
     if label_smoothing > 0.0:
         targets = targets.float() * (1.0 - label_smoothing) + 0.5 * label_smoothing
     return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+
+def corn_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    n_thresholds: int = 3,
+) -> torch.Tensor:
+    """
+    CORN Loss (Conditional Ordinal Regression with Neural Networks)
+    参考: Shi et al., "CORN: Conditional Ordinal Regression for Neural Networks", PR 2021
+
+    核心思想：建模条件概率 P(Y≥k | Y≥k-1) 而不是 P(Y≥k)，
+    天然保证单调性 P(Y≥1) ≥ P(Y≥2) ≥ P(Y≥3)
+
+    参数:
+        logits: (B, n_items, n_thresholds) — 条件 logit
+        labels: (B, n_items) — 整数标签 0~3
+        n_thresholds: 阈值数
+
+    返回:
+        loss: 标量
+    """
+    B, I, T = logits.shape
+    total_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    count = 0
+
+    for k in range(T):
+        # 条件训练集：只选取 labels >= k 的样本
+        if k == 0:
+            mask = torch.ones(B, I, dtype=torch.bool, device=logits.device)
+        else:
+            mask = labels >= k  # (B, I)
+
+        if mask.sum() == 0:
+            continue
+
+        # 目标：在条件集内，labels >= k+1 的样本为正
+        target = (labels >= (k + 1)).float()  # (B, I)
+
+        # 只在条件集上计算 BCE
+        loss_k = F.binary_cross_entropy_with_logits(
+            logits[:, :, k][mask],
+            target[mask],
+            reduction="mean",
+        )
+        total_loss = total_loss + loss_k
+        count += 1
+
+    return total_loss / max(count, 1)
+
+
+def differentiable_qwk_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    n_classes: int = 4,
+    n_thresholds: int = 3,
+) -> torch.Tensor:
+    """
+    可微 QWK 损失：直接优化 QWK 指标的可微近似
+
+    核心思想：构造"软"混淆矩阵（概率版本），直接优化 QWK 指标。
+    QWK 对"大错误"的惩罚更重 (i-j)² → 避免灾难性错误 (0 vs 3)
+
+    参数:
+        logits: (B, n_items, n_thresholds) — 序数回归 logits
+        labels: (B, n_items) — 整数标签 0~3
+        n_classes: 等级数（通常为 4）
+        n_thresholds: 阈值数（通常为 3）
+
+    返回:
+        loss: 标量，1 - soft_QWK
+    """
+    B, I, T = logits.shape
+
+    # Step 1: logits → 各等级概率分布，使用单调约束
+    s = torch.sigmoid(logits)      # (B, I, T) — 累积概率
+    p1 = s[..., 0]                 # P(Y≥1)
+    p2 = torch.min(s[..., 1], p1)  # P(Y≥2) ≤ P(Y≥1)
+    p3 = torch.min(s[..., 2], p2)  # P(Y≥3) ≤ P(Y≥2)
+
+    # 各等级概率：(B, I, 4)
+    P0 = 1.0 - p1
+    P1 = p1 - p2
+    P2 = p2 - p3
+    P3 = p3
+    pred_probs = torch.stack([P0, P1, P2, P3], dim=-1)  # (B, I, 4)
+    pred_probs = pred_probs.clamp(min=1e-7)
+
+    # Step 2: 真实标签的 one-hot 分布
+    true_onehot = F.one_hot(labels.long(), num_classes=n_classes).float()  # (B, I, 4)
+
+    # Step 3: 构造 QWK 权重矩阵 W[i][j] = (i-j)² / (n_classes-1)²
+    idx = torch.arange(n_classes, device=logits.device, dtype=torch.float32)
+    weight_matrix = (idx.unsqueeze(0) - idx.unsqueeze(1)) ** 2  # (4, 4)
+    weight_matrix = weight_matrix / (n_classes - 1) ** 2
+
+    # Step 4: 计算软混淆矩阵（在 batch × items 上汇总）
+    pred_flat = pred_probs.reshape(-1, n_classes)     # (B*I, 4)
+    true_flat = true_onehot.reshape(-1, n_classes)    # (B*I, 4)
+    N = pred_flat.shape[0]
+
+    # 观察混淆矩阵 O[i][j] = Σ_n true_n[i] × pred_n[j] / N
+    O = torch.matmul(true_flat.T, pred_flat) / N  # (4, 4)
+
+    # 期望混淆矩阵 E[i][j] = (Σ_n true_n[i]) × (Σ_n pred_n[j]) / N²
+    hist_true = true_flat.sum(dim=0) / N           # (4,)
+    hist_pred = pred_flat.sum(dim=0) / N           # (4,)
+    E = torch.outer(hist_true, hist_pred)          # (4, 4)
+
+    # Step 5: QWK = 1 - Σ(W × O) / Σ(W × E)
+    numerator = (weight_matrix * O).sum()
+    denominator = (weight_matrix * E).sum().clamp(min=1e-7)
+    soft_qwk = 1.0 - numerator / denominator
+
+    # 返回 1 - QWK 作为损失
+    return 1.0 - soft_qwk
 
 
 def a2_ordinal_loss(
@@ -197,16 +426,53 @@ def a2_ordinal_loss(
     labels: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
+    use_corn: bool = False,
+    use_qwk: bool = False,
+    qwk_weight: float = 0.3,
 ) -> torch.Tensor:
     """
-    A2任务损失：序数回归损失
+    A2 增强序数回归损失（兼容 runner.py 调用接口）
 
-    本质：对 21×3=63 个独立二元问题求 BCE 的平均
-    Step 1：整数标签 (B,21) → 序数目标向量 (B,21,3)
-    Step 2：可选标签平滑
-    Step 3：BCE with logits（数值稳定版）
+    损失组成：
+        base_loss = ordinal_BCE（原始损失，保证基线性能）
+        + use_corn=True  → + CORN_loss（条件序数回归，保证单调性）
+        + use_qwk=True   → + qwk_weight × QWK_loss（直接优化评价指标）
+
+    当 use_corn=False 且 use_qwk=False 时，退化为原始 a2_ordinal_loss。
+
+    参数:
+        logits:          (B, n_items, n_thresholds) — 序数回归 logits
+        labels:          (B, n_items) — 整数标签 0~3
+        pos_weight:      阈值级别的正样本权重
+        label_smoothing: 标签平滑
+        use_corn:        是否使用 CORN 条件序数损失
+        use_qwk:         是否使用可微 QWK 辅助损失
+        qwk_weight:      QWK 损失的权重
+
+    返回:
+        loss: 标量
     """
-    targets = A2OrdinalHead.build_ordinal_targets(labels, n_thresholds=logits.size(-1))
+    n_thresholds = logits.size(-1)
+
+    # 基础损失：标准序数回归 BCE
+    targets = A2OrdinalHead.build_ordinal_targets(labels, n_thresholds=n_thresholds)
+
     if label_smoothing > 0.0:
         targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
-    return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+    base_loss = F.binary_cross_entropy_with_logits(
+        logits, targets, pos_weight=pos_weight
+    )
+
+    total_loss = base_loss
+
+    # CORN 辅助损失：条件概率链
+    if use_corn:
+        total_loss = total_loss + corn_loss(logits, labels, n_thresholds=n_thresholds)
+
+    # 可微 QWK 辅助损失
+    if use_qwk:
+        qwk_loss = differentiable_qwk_loss(logits, labels, n_thresholds=n_thresholds)
+        total_loss = total_loss + qwk_weight * qwk_loss
+
+    return total_loss

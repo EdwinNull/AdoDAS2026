@@ -20,6 +20,8 @@ SESSIONS = ["A01", "B01", "B02", "B03"]
 SESSION_TO_IDX = {s: i for i, s in enumerate(SESSIONS)}
 ITEM_COLS = [f"d{i:02d}" for i in range(1, 22)]
 A1_COLS = ["y_D", "y_A", "y_S"]
+AUX_ATTR_COLS = ["Family structure", "Only child status", "Parental favoritism",
+                 "Academic performance change", "Emotional state change"]
 POOLED_AUDIO_FEATURES = {"egemaps"}
 
 '''
@@ -120,7 +122,13 @@ class MultimodalDataset(Dataset):
     ) -> None:
         self.cfg = cfg
         self.split = split
-        self.root = Path(cfg.feature_root)
+        # 根据 split 动态选择特征根目录
+        configured_root = Path(cfg.feature_root)
+        split_root = configured_root.parent / split
+        if split_root.is_dir():
+            self.root = split_root
+        else:
+            self.root = configured_root
 
         # 加载manifest，检查必要的列
         self.manifest = pd.read_csv(manifest_path)

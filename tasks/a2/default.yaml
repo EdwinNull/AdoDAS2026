@@ -1,6 +1,6 @@
-feature_root: /media/k3nwong/Data1/test/outputs/pipeline/anonymized
-manifest_dir: /media/k3nwong/Data1/test/outputs/data
-output_dir: /media/k3nwong/Data1/test/adodas_baseline/output/a2
+feature_root: ../train
+manifest_dir: ../manifests
+output_dir: ../output/a2
 
 feature_selection:
   audio_features:
@@ -34,6 +34,8 @@ d_shared: 256
 
 aggregator: mlp
 use_coral: true
+use_aux_attrs: true
+aux_embed_dim: 8
 batch_size: 64
 lr: 0.001
 weight_decay: 0.01
@@ -45,7 +47,7 @@ amp: true
 preload: true
 grad_clip: 1.0
 use_pos_weight: true
-patience: 8
+patience: 99
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
 submission_level: participant
@@ -54,3 +56,7 @@ label_smoothing: 0.05
 feature_noise_std: 0.01
 session_drop_prob: 0.1
 early_stop_metric: val_loss
+
+use_corn_loss: 1
+use_qwk_aux: 1
+qwk_weight: 0.3
