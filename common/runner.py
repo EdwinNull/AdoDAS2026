@@ -240,7 +240,7 @@ def _normalize_decode_method(decode_method: str | None) -> str:
     return method
 
 
-def _decode_a2_logits(task_head: nn.Module, logits: torch.Tensor, decode_method: str = "expectation") -> torch.Tensor:
+def _decode_a2_logits(decode_head: nn.Module, logits: torch.Tensor, decode_method: str = "expectation") -> torch.Tensor:
     method = _normalize_decode_method(decode_method)
     if method == "auto":
         raise ValueError("decode_method='auto' is selection-only; pass a concrete decode method")
@@ -252,14 +252,14 @@ def _decode_a2_logits(task_head: nn.Module, logits: torch.Tensor, decode_method:
     else:
         decode_name = "predict_int"
 
-    decode_fn = getattr(task_head, decode_name, None)
+    decode_fn = getattr(decode_head, decode_name, None)
     if decode_fn is None:
         decode_fn = getattr(A2OrdinalHead, decode_name)
     return decode_fn(logits.float())
 
 
 def _evaluate_a2_decode_candidates(
-    task_head: nn.Module,
+    decode_head: nn.Module,
     logits: torch.Tensor,
     labels: np.ndarray,
     decode_methods: list[str],
@@ -271,7 +271,7 @@ def _evaluate_a2_decode_candidates(
 
     results: dict[str, dict[str, float | np.ndarray | str]] = {}
     for method in decode_methods:
-        preds = _decode_a2_logits(task_head, logits_f, decode_method=method).cpu().numpy()
+        preds = _decode_a2_logits(decode_head, logits_f, decode_method=method).cpu().numpy()
         qwk = mean_qwk(preds, labels)
         mae = mean_mae(preds, labels)
         results[method] = {
@@ -329,7 +329,8 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
 
 def train_one_epoch_grouped(
     grouped_model: GroupedModel,
-    task_head: nn.Module,
+    participant_head: nn.Module,
+    session_head: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -357,7 +358,8 @@ def train_one_epoch_grouped(
     qwk_weight: float = 0.3,
 ) -> float:
     grouped_model.train()
-    task_head.train()
+    participant_head.train()
+    session_head.train()
     total_loss = 0.0
     n_batches = 0
 
@@ -367,6 +369,8 @@ def train_one_epoch_grouped(
     pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
 
     for batch in pbar:
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         session_types = batch["session_types"].to(device)
@@ -395,7 +399,7 @@ def train_one_epoch_grouped(
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
-            p_logits = task_head(out["participant_repr"])
+            p_logits = participant_head(out["participant_repr"])
             if task == "a1":
                 main_loss = a1_loss(
                     p_logits, targets,
@@ -418,7 +422,7 @@ def train_one_epoch_grouped(
                 )
 
             if has_valid_sessions:
-                s_logits = task_head(out["session_reprs"])[valid_session_mask]
+                s_logits = session_head(out["session_reprs"])[valid_session_mask]
                 if task == "a1":
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
                     sess_loss = a1_loss(
@@ -457,7 +461,7 @@ def train_one_epoch_grouped(
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
+                list(grouped_model.parameters()) + list(participant_head.parameters()) + list(session_head.parameters()),
                 max_norm=grad_clip,
             )
             scaler.step(optimizer)
@@ -465,7 +469,7 @@ def train_one_epoch_grouped(
         else:
             loss.backward()
             nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
+                list(grouped_model.parameters()) + list(participant_head.parameters()) + list(session_head.parameters()),
                 max_norm=grad_clip,
             )
             optimizer.step()
@@ -481,7 +485,8 @@ def train_one_epoch_grouped(
 @torch.no_grad()
 def validate_grouped(
     grouped_model: GroupedModel,
-    task_head: nn.Module,
+    participant_head: nn.Module,
+    session_head: nn.Module,
     loader: DataLoader,
     device: torch.device,
     task: str,
@@ -493,7 +498,8 @@ def validate_grouped(
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
-    task_head.eval()
+    participant_head.eval()
+    session_head.eval()
     decode_method = _normalize_decode_method(decode_method)
     total_loss = 0.0
     n_batches = 0
@@ -503,6 +509,9 @@ def validate_grouped(
     all_sess_preds = []
 
     for batch in tqdm(loader, desc=f"Val {epoch}/{epochs}", leave=False, dynamic_ncols=True):
+        if batch is None:
+            log.debug("validate_grouped: skipped None batch")
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -519,13 +528,13 @@ def validate_grouped(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid, aux_attrs)
-            p_logits = task_head(out["participant_repr"])
+            p_logits = participant_head(out["participant_repr"])
             if task == "a1":
                 loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
             else:
                 loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight)
 
-            s_logits = task_head(out["session_reprs"])
+            s_logits = session_head(out["session_reprs"])
 
         if task == "a1":
             logits_np = p_logits.float().cpu().numpy()
@@ -540,7 +549,7 @@ def validate_grouped(
             if decode_method == "auto":
                 all_logits.append(p_logits.float().cpu())
             else:
-                preds = _decode_a2_logits(task_head, p_logits, decode_method=decode_method)
+                preds = _decode_a2_logits(participant_head, p_logits, decode_method=decode_method)
                 all_preds.append(preds.cpu().numpy())
             all_labels.append(targets.cpu().numpy())
 
@@ -548,6 +557,25 @@ def validate_grouped(
         n_batches += 1
 
     avg_loss = total_loss / max(n_batches, 1)
+
+    if n_batches == 0:
+        log.warning("validate_grouped: all batches were None/skipped, returning dummy metrics")
+        if task == "a1":
+            return {
+                "loss": avg_loss, "mean_f1": 0.0, "auroc": 0.0,
+                "pcf1": [0.0, 0.0, 0.0],
+                "mean_f1_calibrated": 0.0,
+                "pcf1_calibrated": [0.0, 0.0, 0.0],
+                "calibration_biases": [0.0, 0.0, 0.0],
+                "primary_metric": 0.0,
+                "selection_source": "raw",
+            }
+        else:
+            return {
+                "loss": avg_loss, "mean_qwk": 0.0, "mean_mae": 999.0,
+                "auto_decode": None,
+                "primary_metric": 0.0,
+            }
 
     if task == "a1":
         probs_np = np.concatenate(all_preds)
@@ -607,7 +635,7 @@ def validate_grouped(
         if decode_method == "auto":
             logits_t = torch.cat(all_logits, dim=0)
             raw_results = _evaluate_a2_decode_candidates(
-                task_head,
+                participant_head,
                 logits_t,
                 labels_np,
                 decode_methods=["argmax", "monotonic", "expectation"],
@@ -645,7 +673,8 @@ def validate_grouped(
 @torch.no_grad()
 def generate_submission_grouped(
     grouped_model: GroupedModel,
-    task_head: nn.Module,
+    participant_head: nn.Module,
+    session_head: nn.Module,
     loader: DataLoader,
     device: torch.device,
     task: str,
@@ -657,7 +686,8 @@ def generate_submission_grouped(
     a2_threshold_offsets: np.ndarray | None = None,
 ):
     grouped_model.eval()
-    task_head.eval()
+    participant_head.eval()
+    session_head.eval()
     decode_method = _normalize_decode_method(decode_method)
     if submission_level not in {"participant", "session"}:
         raise ValueError("submission_level must be 'participant' or 'session'")
@@ -672,6 +702,8 @@ def generate_submission_grouped(
     )
 
     for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -685,9 +717,9 @@ def generate_submission_grouped(
             out = grouped_model(flat_batch, B, session_valid, aux_attrs)
 
             if submission_level == "participant":
-                logits = task_head(out["participant_repr"])
+                logits = participant_head(out["participant_repr"])
             else:
-                logits = task_head(out["session_reprs"])
+                logits = session_head(out["session_reprs"])
 
         if task == "a1":
             logits_f = logits.float()
@@ -698,7 +730,9 @@ def generate_submission_grouped(
             logits_f = logits.float()
             if a2_offsets_t is not None:
                 logits_f = logits_f + a2_offsets_t
-            preds = _decode_a2_logits(task_head, logits_f, decode_method=decode_method).cpu().numpy()
+            # 根据submission_level选择对应的head用于解码
+            decode_head = participant_head if submission_level == "participant" else session_head
+            preds = _decode_a2_logits(decode_head, logits_f, decode_method=decode_method).cpu().numpy()
 
         if submission_level == "participant":
             participant_ids = [str(pid) for pid in batch["anon_pids"]]
@@ -714,13 +748,16 @@ def generate_submission_grouped(
 
 
 @torch.no_grad()
-def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_amp,
+def collect_val_logits_grouped_a1(grouped_model, participant_head, session_head, loader, device, use_amp,
                                    submission_level="participant"):
     grouped_model.eval()
-    task_head.eval()
+    participant_head.eval()
+    session_head.eval()
     all_logits = []
     all_labels = []
     for batch in loader:
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -731,11 +768,11 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid, aux_attrs)
             if submission_level == "participant":
-                logits = task_head(out["participant_repr"]).float().cpu().numpy()
+                logits = participant_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a1"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
+                logits = session_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a1"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -744,14 +781,17 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
 
 
 @torch.no_grad()
-def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_amp,
+def collect_val_logits_grouped_a2(grouped_model, participant_head, session_head, loader, device, use_amp,
                                    submission_level="participant"):
     """Collect A2 logits and labels from validation set for calibration."""
     grouped_model.eval()
-    task_head.eval()
+    participant_head.eval()
+    session_head.eval()
     all_logits = []
     all_labels = []
     for batch in loader:
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -762,11 +802,11 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid, aux_attrs)
             if submission_level == "participant":
-                logits = task_head(out["participant_repr"]).float().cpu().numpy()
+                logits = participant_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a2"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
+                logits = session_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a2"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -793,7 +833,7 @@ def calibrate_a2_thresholds(logits, labels, n_items=21, n_thresholds=3,
         for b in grid:
             shifted = logits[:, j, :] + b  # (N, 3)
             shifted_t = torch.from_numpy(shifted).float().unsqueeze(0)
-            preds = _decode_a2_logits(task_head=decode_head, logits=shifted_t, decode_method=decode_method)
+            preds = _decode_a2_logits(decode_head=decode_head, logits=shifted_t, decode_method=decode_method)
             preds = preds.squeeze(0).cpu().numpy().astype(int)
             try:
                 with warnings.catch_warnings():
@@ -946,19 +986,27 @@ def main() -> None:
     ).to(device)
 
     use_coral = bool(cfg.get("use_coral", False))
-    # 任务头的输入维度 = d_shared + aux_dim
-    task_head_input_dim = bb_cfg.d_shared + aux_dim
+    # 参与者级任务头：输入维度 = d_shared + aux_dim
+    participant_head_input_dim = bb_cfg.d_shared + aux_dim
+    # 会话级任务头：输入维度 = d_shared（不包含辅助属性）
+    session_head_input_dim = bb_cfg.d_shared
+
     if task == "a1":
         bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
-        task_head = A1Head(task_head_input_dim, bias_init=bias_init).to(device)
+        participant_head = A1Head(participant_head_input_dim, bias_init=bias_init).to(device)
+        session_head = A1Head(session_head_input_dim, bias_init=bias_init).to(device)
     else:
         if use_coral:
-            task_head = CORALHead(task_head_input_dim).to(device)
+            participant_head = CORALHead(participant_head_input_dim).to(device)
+            session_head = CORALHead(session_head_input_dim).to(device)
             log.info("Using CORAL head for A2")
         else:
-            task_head = A2OrdinalHead(task_head_input_dim).to(device)
+            participant_head = A2OrdinalHead(participant_head_input_dim).to(device)
+            session_head = A2OrdinalHead(session_head_input_dim).to(device)
 
-    n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
+    n_params = (sum(p.numel() for p in grouped_model.parameters()) +
+                sum(p.numel() for p in participant_head.parameters()) +
+                sum(p.numel() for p in session_head.parameters()))
     log.info(f"Model params: {n_params:,}")
 
     use_amp = bool(cfg.get("amp", True))
@@ -977,7 +1025,9 @@ def main() -> None:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
-    params = list(grouped_model.parameters()) + list(task_head.parameters())
+    params = (list(grouped_model.parameters()) +
+              list(participant_head.parameters()) +
+              list(session_head.parameters()))
     optimizer = torch.optim.AdamW(
         params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
@@ -1020,7 +1070,7 @@ def main() -> None:
         t0 = time.time()
 
         train_loss = train_one_epoch_grouped(
-            grouped_model, task_head, train_loader, optimizer, device,
+            grouped_model, participant_head, session_head, train_loader, optimizer, device,
             task, epoch, epochs, scaler, use_amp,
             pos_weight=pos_weight_t, grad_clip=grad_clip,
             session_loss_weight=session_loss_weight,
@@ -1031,7 +1081,7 @@ def main() -> None:
         )
 
         val_metrics = validate_grouped(
-            grouped_model, task_head, val_loader, device,
+            grouped_model, participant_head, session_head, val_loader, device,
             task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
             decode_method=cfg.get("decode_method", "expectation"),
         )
@@ -1068,7 +1118,10 @@ def main() -> None:
             save_checkpoint(
                 run_dirs["checkpoints"] / "best.pt",
                 grouped_model, optimizer, epoch, best_metric,
-                extra={"head_state_dict": task_head.state_dict()},
+                extra={
+                    "participant_head_state_dict": participant_head.state_dict(),
+                    "session_head_state_dict": session_head.state_dict(),
+                },
             )
             log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
             meta.update_best(epoch, val_metrics)
@@ -1084,9 +1137,11 @@ def main() -> None:
 
     log.info("Loading best checkpoint for submission generation ...")
     state = load_checkpoint(run_dirs["checkpoints"] / "best.pt", grouped_model, optimizer=None)
-    task_head.load_state_dict(state["head_state_dict"])
+    participant_head.load_state_dict(state["participant_head_state_dict"])
+    session_head.load_state_dict(state["session_head_state_dict"])
     grouped_model.to(device)
-    task_head.to(device)
+    participant_head.to(device)
+    session_head.to(device)
 
     submission_level = cfg.get("submission_level", "participant")
     decode_method = _normalize_decode_method(cfg.get("decode_method", "expectation"))
@@ -1100,7 +1155,7 @@ def main() -> None:
     if task == "a1":
         log.info("Calibrating per-task bias offsets on val ...")
         val_logits, val_labels = collect_val_logits_grouped_a1(
-            grouped_model, task_head, val_loader, device, use_amp,
+            grouped_model, participant_head, session_head, val_loader, device, use_amp,
             submission_level=submission_level,
         )
         biases, cal_f1s = calibrate_a1_bias(val_logits, val_labels)
@@ -1130,12 +1185,14 @@ def main() -> None:
     else:
         log.info("Calibrating and selecting A2 decode strategy on val ...")
         val_logits, val_labels = collect_val_logits_grouped_a2(
-            grouped_model, task_head, val_loader, device, use_amp,
+            grouped_model, participant_head, session_head, val_loader, device, use_amp,
             submission_level=submission_level,
         )
         val_labels_int = val_labels.astype(int)
+        # 根据submission_level选择对应的head用于解码
+        decode_head = participant_head if submission_level == "participant" else session_head
         raw_results = _evaluate_a2_decode_candidates(
-            task_head,
+            decode_head,
             torch.from_numpy(val_logits).float(),
             val_labels_int,
             decode_methods=["argmax", "monotonic", "expectation"],
@@ -1148,7 +1205,7 @@ def main() -> None:
                 decode_method=method,
             )
             preds = _decode_a2_logits(
-                task_head,
+                decode_head,
                 torch.from_numpy(val_logits).float() + torch.as_tensor(offsets, dtype=torch.float32),
                 decode_method=method,
             ).cpu().numpy()
@@ -1221,7 +1278,7 @@ def main() -> None:
             )
 
             pids, sessions, preds = generate_submission_grouped(
-                grouped_model, task_head, loader, device, task, use_amp,
+                grouped_model, participant_head, session_head, loader, device, task, use_amp,
                 desc=f"Submit {split_name}",
                 submission_level=submission_level,
                 a1_biases=a1_biases,

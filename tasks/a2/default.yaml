@@ -47,7 +47,7 @@ amp: true
 preload: true
 grad_clip: 1.0
 use_pos_weight: true
-patience: 8
+patience: 99
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
 submission_level: participant

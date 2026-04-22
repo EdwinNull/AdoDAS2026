@@ -37,8 +37,17 @@ class GroupedParticipantDataset(Dataset):
     ) -> None:
         self.cfg = cfg
         self.split = split
-        self.root = Path(cfg.feature_root)
         self.session_drop_prob = float(session_drop_prob)
+
+        # 根据 split 动态选择特征根目录：
+        # feature_root 通常指向训练集目录（如 ../train），
+        # 验证集/测试集特征在同级的 ../val、../test_hidden 等目录下。
+        configured_root = Path(cfg.feature_root)
+        split_root = configured_root.parent / split
+        if split_root.is_dir():
+            self.root = split_root
+        else:
+            self.root = configured_root
 
         manifest = pd.read_csv(manifest_path)
 
@@ -457,7 +466,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
                     flat_sess_names.append(SESSIONS[s_idx])
 
     if not all_sessions:
-        raise RuntimeError("No valid sessions in batch")
+        return None
 
     # 展平后的批次大小和最大序列长度
     n_flat = len(all_sessions)

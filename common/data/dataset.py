@@ -122,7 +122,13 @@ class MultimodalDataset(Dataset):
     ) -> None:
         self.cfg = cfg
         self.split = split
-        self.root = Path(cfg.feature_root)
+        # 根据 split 动态选择特征根目录
+        configured_root = Path(cfg.feature_root)
+        split_root = configured_root.parent / split
+        if split_root.is_dir():
+            self.root = split_root
+        else:
+            self.root = configured_root
 
         # 加载manifest，检查必要的列
         self.manifest = pd.read_csv(manifest_path)
