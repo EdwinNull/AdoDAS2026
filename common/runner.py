@@ -363,6 +363,8 @@ def train_one_epoch_grouped(
     pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
 
     for batch in pbar:
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         session_types = batch["session_types"].to(device)
@@ -494,6 +496,8 @@ def validate_grouped(
     all_sess_preds = []
 
     for batch in tqdm(loader, desc=f"Val {epoch}/{epochs}", leave=False, dynamic_ncols=True):
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -658,6 +662,8 @@ def generate_submission_grouped(
     )
 
     for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -702,6 +708,8 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
     all_logits = []
     all_labels = []
     for batch in loader:
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -729,6 +737,8 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
     all_logits = []
     all_labels = []
     for batch in loader:
+        if batch is None:
+            continue
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]

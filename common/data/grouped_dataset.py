@@ -254,7 +254,7 @@ class GroupedParticipantDataset(Dataset):
                 "session": str(row["session"]),
             }
         except Exception as e:
-            log.debug(f"Failed to load session {row.get('session', '?')} for {row.get('anon_pid', '?')}: {e}")
+            log.warning(f"Failed to load session {row.get('session', '?')} for {row.get('anon_pid', '?')}: {e}")
             return None  # 静默失败，允许部分会话缺失
 
     def __len__(self) -> int:
@@ -452,7 +452,8 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
                     flat_sess_names.append(SESSIONS[s_idx])
 
     if not all_sessions:
-        raise RuntimeError("No valid sessions in batch")
+        log.warning("No valid sessions in batch — returning None (batch will be skipped)")
+        return None
 
     # 展平后的批次大小和最大序列长度
     n_flat = len(all_sessions)

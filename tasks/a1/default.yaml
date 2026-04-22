@@ -1,4 +1,4 @@
-feature_root: ../train
+feature_root: ..
 manifest_dir: ../manifests
 output_dir: ../output/a1
 
