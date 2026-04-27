@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 
-def seed_everything(seed: int = 42) -> None:
+def seed_everything(seed: int = 325799) -> None:
     random.seed(seed) # 固定random种子
     os.environ["PYTHONHASHSEED"] = str(seed) # 固定Python hash种子
     np.random.seed(seed) # 固定numpy种子

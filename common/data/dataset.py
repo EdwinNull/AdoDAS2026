@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from multiprocessing import Pool
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -202,24 +204,51 @@ class MultimodalDataset(Dataset):
 
 
     # 预加载机制
-    def preload(self, desc: str | None = None) -> float:
+    def preload(self, desc: str | None = None, num_workers: int = 8) -> float:
         n = len(self)
         if desc is None:
             desc = f"Preload {self.split}"
         self._cache = [None] * n
         errors = 0
-        for i in tqdm(range(n), desc=desc, dynamic_ncols=True):
-            try:
-                self._cache[i] = self._load_sample(i)
-            except Exception as exc:
-                errors += 1
-                if errors <= 3:
-                    log.warning(f"Preload: sample {i} failed: {exc}")
+
+        # 多进程并行加载
+        if num_workers > 1:
+            with Pool(num_workers) as pool:
+                results = list(tqdm(
+                    pool.imap(self._load_sample_safe, range(n)),
+                    total=n,
+                    desc=desc,
+                    dynamic_ncols=True
+                ))
+
+            for i, result in enumerate(results):
+                if result is not None:
+                    self._cache[i] = result
+                else:
+                    errors += 1
+        else:
+            # 单进程加载（原逻辑）
+            for i in tqdm(range(n), desc=desc, dynamic_ncols=True):
+                try:
+                    self._cache[i] = self._load_sample(i)
+                except Exception as exc:
+                    errors += 1
+                    if errors <= 3:
+                        log.warning(f"Preload: sample {i} failed: {exc}")
+
         if errors > 0:
             log.warning(f"Preload: {errors}/{n} samples failed and will be skipped")
         gb = self._estimate_cache_bytes() / 1024**3
         log.info(f"Preloaded {n - errors}/{n} samples ({gb:.1f} GB in RAM)")
         return gb
+
+    def _load_sample_safe(self, idx: int) -> dict[str, Any] | None:
+        """多进程安全的样本加载（捕获异常）"""
+        try:
+            return self._load_sample(idx)
+        except Exception as exc:
+            log.warning(f"Preload: sample {idx} failed: {exc}")
+            return None
 
     def _estimate_cache_bytes(self) -> int:
         total = 0

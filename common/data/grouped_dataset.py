@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
@@ -362,24 +363,51 @@ class GroupedParticipantDataset(Dataset):
             "session_valid": session_valid,
         }
 
-    def preload(self, desc: str | None = None) -> float:
+    def preload(self, desc: str | None = None, num_workers: int = 8) -> float:
         n = len(self)
         if desc is None:
             desc = f"Preload {self.split}"
         self._cache = [None] * n
         errors = 0
-        for i in tqdm(range(n), desc=desc, dynamic_ncols=True):
-            try:
-                self._cache[i] = self._load_participant(i)
-            except Exception as exc:
-                errors += 1
-                if errors <= 3:
-                    log.warning(f"Preload: participant {i} failed: {exc}")
+
+        # 多进程并行加载
+        if num_workers > 1:
+            with Pool(num_workers) as pool:
+                results = list(tqdm(
+                    pool.imap(self._load_participant_safe, range(n)),
+                    total=n,
+                    desc=desc,
+                    dynamic_ncols=True
+                ))
+
+            for i, result in enumerate(results):
+                if result is not None:
+                    self._cache[i] = result
+                else:
+                    errors += 1
+        else:
+            # 单进程加载（原逻辑）
+            for i in tqdm(range(n), desc=desc, dynamic_ncols=True):
+                try:
+                    self._cache[i] = self._load_participant(i)
+                except Exception as exc:
+                    errors += 1
+                    if errors <= 3:
+                        log.warning(f"Preload: participant {i} failed: {exc}")
+
         if errors > 0:
             log.warning(f"Preload: {errors}/{n} participants failed")
         gb = self._estimate_cache_bytes() / 1024**3
         log.info(f"Preloaded {n - errors}/{n} participants ({gb:.1f} GB in RAM)")
         return gb
+
+    def _load_participant_safe(self, idx: int) -> dict[str, Any] | None:
+        """多进程安全的参与者加载（捕获异常）"""
+        try:
+            return self._load_participant(idx)
+        except Exception as exc:
+            log.warning(f"Preload: participant {idx} failed: {exc}")
+            return None
 
     def _estimate_cache_bytes(self) -> int:
         total = 0
