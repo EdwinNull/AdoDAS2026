@@ -41,10 +41,12 @@ lr: 0.001
 weight_decay: 0.01
 warmup_epochs: 3
 epochs: 40
-seed: 42
+seed: 325799
 num_workers: 8
+preload_workers: 16
 amp: true
 preload: true
+use_hdf5: true
 grad_clip: 1.0
 use_pos_weight: true
 patience: 10

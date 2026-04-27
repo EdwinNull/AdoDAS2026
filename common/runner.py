@@ -22,6 +22,7 @@ import yaml
 
 from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
 from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
+from .data.hdf5_dataset import HDF5GroupedDataset
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss
 from .models.grouped_model import GroupedModel, CORALHead
@@ -110,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--amp", type=int, default=None)
     p.add_argument("--preload", type=int, default=None)
+    p.add_argument("--use_hdf5", type=int, default=None, help="1=use HDF5 packed dataset")
     p.add_argument("--patience", type=int, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
@@ -910,25 +912,59 @@ def main() -> None:
     )
     log.info(f"Mask policy: {feat_cfg.mask_policy}")
 
-    train_ds = GroupedParticipantDataset(
-        manifest_dir / "train.csv", feat_cfg, split="train",
-        session_drop_prob=cfg.get("session_drop_prob", 0.1),
-    )
-    val_ds = GroupedParticipantDataset(manifest_dir / "val.csv", feat_cfg, split="val")
+    # 选择使用HDF5或原始数据集
+    use_hdf5 = bool(cfg.get("use_hdf5", False))
+
+    if use_hdf5:
+        log.info("Using HDF5 packed datasets")
+        # HDF5路径：假设在feature_root的父目录
+        hdf5_dir = Path(cfg["feature_root"]).parent
+        train_hdf5 = hdf5_dir / "train_packed.h5"
+        val_hdf5 = hdf5_dir / "val_packed.h5"
+
+        if not train_hdf5.exists() or not val_hdf5.exists():
+            raise FileNotFoundError(
+                f"HDF5 files not found:\n"
+                f"  Train: {train_hdf5}\n"
+                f"  Val: {val_hdf5}\n"
+                f"Run scripts/pack_features.py first"
+            )
+
+        preload = bool(cfg.get("preload", True))
+        train_ds = HDF5GroupedDataset(
+            hdf5_path=train_hdf5,
+            session_drop_prob=cfg.get("session_drop_prob", 0.1),
+            preload=preload,
+        )
+        val_ds = HDF5GroupedDataset(
+            hdf5_path=val_hdf5,
+            session_drop_prob=0.0,
+            preload=preload,
+        )
+    else:
+        log.info("Using original scattered datasets")
+        train_ds = GroupedParticipantDataset(
+            manifest_dir / "train.csv", feat_cfg, split="train",
+            session_drop_prob=cfg.get("session_drop_prob", 0.1),
+        )
+        val_ds = GroupedParticipantDataset(manifest_dir / "val.csv", feat_cfg, split="val")
 
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
     log.info(f"Train: {len(train_ds)} participants, Val: {len(val_ds)} participants")
 
-    preload = bool(cfg.get("preload", True))
-    if preload:
-        log.info("Preloading data into RAM ...")
-        t_pre = time.time()
-        train_gb = train_ds.preload(desc="Preload train")
-        val_gb = val_ds.preload(desc="Preload val")
-        log.info(f"Preload done: {train_gb:.1f}G + {val_gb:.1f}G = {train_gb + val_gb:.1f}G, "
-                 f"took {_fmt_duration(time.time() - t_pre)}")
-        num_workers = 0
+    # 如果使用原始数据集且需要preload
+    if not use_hdf5:
+        preload = bool(cfg.get("preload", True))
+        if preload:
+            log.info("Preloading data into RAM ...")
+            t_pre = time.time()
+            preload_workers = cfg.get("preload_workers", num_workers)
+            train_gb = train_ds.preload(desc="Preload train", num_workers=preload_workers)
+            val_gb = val_ds.preload(desc="Preload val", num_workers=preload_workers)
+            log.info(f"Preload done: {train_gb:.1f}G + {val_gb:.1f}G = {train_gb + val_gb:.1f}G, "
+                     f"took {_fmt_duration(time.time() - t_pre)}")
+            num_workers = 0
 
     log.info(f"batch_size={batch_size}, num_workers={num_workers}")
 
