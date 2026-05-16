@@ -26,6 +26,7 @@ from .data.hdf5_dataset import HDF5GroupedDataset
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss
 from .models.grouped_model import GroupedModel, CORALHead
+from .models.phase1_integration import OptimizedGroupedModel, compute_optimized_loss
 from .utils.seed import seed_everything
 from .utils.metrics import binary_f1, macro_auroc, per_class_f1, mean_qwk, mean_mae, per_item_qwk
 from .utils.ckpt import save_checkpoint, load_checkpoint
@@ -482,6 +483,157 @@ def train_one_epoch_grouped(
 
     pbar.close()
     return total_loss / max(n_batches, 1)
+
+
+def train_one_epoch_mtl(
+    optimized_model: OptimizedGroupedModel,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    task: str,
+    epoch: int,
+    epochs: int,
+    scaler=None,
+    use_amp: bool = False,
+    pos_weight=None,
+    grad_clip: float = 1.0,
+    best_metric: float = -1.0,
+    label_smoothing: float = 0.0,
+    feature_noise_std: float = 0.0,
+    # A1 损失函数参数
+    use_combined_loss: bool = False,
+    gamma_neg: float = 2.0,
+    gamma_pos: float = 0.0,
+    clip: float = 0.05,
+    soft_f1_weight: float = 0.3,
+    # A2 损失函数参数
+    use_corn_loss: bool = False,
+    use_qwk_aux: bool = False,
+    qwk_weight: float = 0.3,
+    # MTL 固定权重（仅在不使用不确定性加权时生效）
+    session_loss_weight: float = 0.5,
+    session_type_loss_weight: float = 0.15,
+    emotion_dims_weight: float = 0.2,
+    emotion_cls_weight: float = 0.15,
+    au_pred_weight: float = 0.1,
+) -> tuple[float, dict]:
+    """
+    使用MTL的训练循环
+
+    返回:
+        avg_loss: 平均总损失
+        avg_loss_dict: 各任务损失的平均值
+    """
+    optimized_model.train()
+    total_loss = 0.0
+    n_batches = 0
+    accumulated_losses = {}
+
+    desc = f"Train MTL {epoch}/{epochs}"
+    if best_metric >= 0:
+        desc += f" [best={best_metric:.4f}]"
+    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+
+    for batch in pbar:
+        if batch is None:
+            continue
+
+        flat_batch = _to_device(batch["flat_batch"], device)
+        session_valid = batch["session_valid"].to(device)
+        session_types = batch["session_types"].to(device)
+        B = batch["n_participants"]
+
+        # 特征噪声增强
+        if feature_noise_std > 0.0:
+            noise_mask = (~flat_batch["pad_mask"]).unsqueeze(-1).float()
+            for key in ("audio_groups", "video_groups"):
+                for name in flat_batch[key]:
+                    flat_batch[key][name] = flat_batch[key][name] + torch.randn_like(
+                        flat_batch[key][name]
+                    ) * feature_noise_std * noise_mask
+
+        # 准备目标
+        if task == "a1":
+            participant_y = batch["participant_y_a1"].to(device)
+        else:
+            participant_y = batch["participant_y_a2"].to(device).long()
+
+        targets = {
+            "participant_y": participant_y,
+            "session_types": session_types,
+        }
+
+        # 添加辅助任务标签
+        if "auxiliary_targets" in batch:
+            targets["auxiliary_targets"] = {
+                k: v.to(device) for k, v in batch["auxiliary_targets"].items()
+            }
+
+        # 获取辅助属性
+        aux_attrs = batch.get("participant_aux_attrs")
+        if aux_attrs is not None:
+            aux_attrs = aux_attrs.to(device)
+
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            # 前向传播
+            outputs = optimized_model(flat_batch, B, session_valid, aux_attrs)
+
+            # 计算损失
+            loss, loss_dict = compute_optimized_loss(
+                outputs=outputs,
+                targets=targets,
+                model=optimized_model,
+                task=task,
+                session_valid=session_valid,
+                pos_weight=pos_weight,
+                label_smoothing=label_smoothing,
+                use_combined_loss=use_combined_loss,
+                gamma_neg=gamma_neg,
+                gamma_pos=gamma_pos,
+                clip=clip,
+                soft_f1_weight=soft_f1_weight,
+                use_corn_loss=use_corn_loss,
+                use_qwk_aux=use_qwk_aux,
+                qwk_weight=qwk_weight,
+                session_loss_weight=session_loss_weight,
+                session_type_loss_weight=session_type_loss_weight,
+                emotion_dims_weight=emotion_dims_weight,
+                emotion_cls_weight=emotion_cls_weight,
+                au_pred_weight=au_pred_weight,
+            )
+
+        # 反向传播
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(optimized_model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(optimized_model.parameters(), max_norm=grad_clip)
+            optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+        # 累积各任务损失
+        for key, val in loss_dict.items():
+            if key not in accumulated_losses:
+                accumulated_losses[key] = 0.0
+            accumulated_losses[key] += val
+
+        # 显示主要损失
+        pbar.set_postfix_str(f"loss={loss.item():.4f} main={loss_dict.get('main_loss', 0):.4f}")
+
+    pbar.close()
+
+    # 计算平均损失
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_loss_dict = {k: v / max(n_batches, 1) for k, v in accumulated_losses.items()}
+
+    return avg_loss, avg_loss_dict
 
 
 @torch.no_grad()
@@ -1045,6 +1197,42 @@ def main() -> None:
                 sum(p.numel() for p in session_head.parameters()))
     log.info(f"Model params: {n_params:,}")
 
+    # 检查是否启用MTL
+    enable_mtl = bool(cfg.get("enable_auxiliary_tasks", False))
+    use_uncertainty_weighting = bool(cfg.get("use_uncertainty_weighting", False))
+
+    if enable_mtl:
+        log.info("=" * 60)
+        log.info("MTL (Multi-Task Learning) ENABLED")
+        log.info("=" * 60)
+
+        # 创建优化模型包装器
+        optimized_model = OptimizedGroupedModel(
+            grouped_model=grouped_model,
+            participant_head=participant_head,
+            session_head=session_head,
+            d_shared=bb_cfg.d_shared,
+            aux_dim=aux_dim,
+            use_uncertainty_weighting=use_uncertainty_weighting,
+            enable_auxiliary_tasks=True,
+            enable_emotion_dims=bool(cfg.get("enable_emotion_dims", True)),
+            enable_emotion_cls=bool(cfg.get("enable_emotion_cls", True)),
+            enable_au_pred=bool(cfg.get("enable_au_pred", False)),
+        ).to(device)
+
+        log.info(f"Uncertainty weighting: {use_uncertainty_weighting}")
+        log.info(f"Emotion dims prediction: {cfg.get('enable_emotion_dims', True)}")
+        log.info(f"Emotion classification: {cfg.get('enable_emotion_cls', True)}")
+        log.info(f"AU prediction: {cfg.get('enable_au_pred', False)}")
+
+        # 重新计算参数数量
+        n_params_mtl = sum(p.numel() for p in optimized_model.parameters())
+        log.info(f"MTL model params: {n_params_mtl:,} (+{n_params_mtl - n_params:,})")
+        log.info("=" * 60)
+    else:
+        optimized_model = None
+        log.info("MTL disabled, using standard training")
+
     use_amp = bool(cfg.get("amp", True))
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
     if use_amp:
@@ -1061,9 +1249,14 @@ def main() -> None:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
-    params = (list(grouped_model.parameters()) +
-              list(participant_head.parameters()) +
-              list(session_head.parameters()))
+    # 优化器参数
+    if enable_mtl:
+        params = list(optimized_model.parameters())
+    else:
+        params = (list(grouped_model.parameters()) +
+                  list(participant_head.parameters()) +
+                  list(session_head.parameters()))
+
     optimizer = torch.optim.AdamW(
         params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
@@ -1105,17 +1298,53 @@ def main() -> None:
     for epoch in range(1, epochs + 1):
         t0 = time.time()
 
-        train_loss = train_one_epoch_grouped(
-            grouped_model, participant_head, session_head, train_loader, optimizer, device,
-            task, epoch, epochs, scaler, use_amp,
-            pos_weight=pos_weight_t, grad_clip=grad_clip,
-            session_loss_weight=session_loss_weight,
-            session_type_loss_weight=session_type_loss_weight,
-            best_metric=best_metric,
-            label_smoothing=label_smoothing,
-            feature_noise_std=feature_noise_std,
-        )
+        # 根据是否启用MTL选择训练函数
+        if enable_mtl:
+            train_loss, train_loss_dict = train_one_epoch_mtl(
+                optimized_model, train_loader, optimizer, device,
+                task, epoch, epochs, scaler, use_amp,
+                pos_weight=pos_weight_t, grad_clip=grad_clip,
+                best_metric=best_metric,
+                label_smoothing=label_smoothing,
+                feature_noise_std=feature_noise_std,
+                use_combined_loss=bool(cfg.get("use_combined_loss", False)),
+                gamma_neg=cfg.get("gamma_neg", 2.0),
+                gamma_pos=cfg.get("gamma_pos", 0.0),
+                clip=cfg.get("clip", 0.05),
+                soft_f1_weight=cfg.get("soft_f1_weight", 0.3),
+                use_corn_loss=bool(cfg.get("use_corn_loss", False)),
+                use_qwk_aux=bool(cfg.get("use_qwk_aux", False)),
+                qwk_weight=cfg.get("qwk_weight", 0.3),
+                session_loss_weight=session_loss_weight,
+                session_type_loss_weight=session_type_loss_weight,
+                emotion_dims_weight=cfg.get("emotion_dims_weight", 0.2),
+                emotion_cls_weight=cfg.get("emotion_cls_weight", 0.15),
+                au_pred_weight=cfg.get("au_pred_weight", 0.1),
+            )
+            # 记录详细损失
+            if epoch % 5 == 0 or epoch == 1:
+                log.info(f"  Detailed losses at epoch {epoch}: {train_loss_dict}")
+        else:
+            train_loss = train_one_epoch_grouped(
+                grouped_model, participant_head, session_head, train_loader, optimizer, device,
+                task, epoch, epochs, scaler, use_amp,
+                pos_weight=pos_weight_t, grad_clip=grad_clip,
+                session_loss_weight=session_loss_weight,
+                session_type_loss_weight=session_type_loss_weight,
+                best_metric=best_metric,
+                label_smoothing=label_smoothing,
+                feature_noise_std=feature_noise_std,
+                use_combined_loss=bool(cfg.get("use_combined_loss", False)),
+                gamma_neg=cfg.get("gamma_neg", 2.0),
+                gamma_pos=cfg.get("gamma_pos", 0.0),
+                clip=cfg.get("clip", 0.05),
+                soft_f1_weight=cfg.get("soft_f1_weight", 0.3),
+                use_corn_loss=bool(cfg.get("use_corn_loss", False)),
+                use_qwk_aux=bool(cfg.get("use_qwk_aux", False)),
+                qwk_weight=cfg.get("qwk_weight", 0.3),
+            )
 
+        # 验证（MTL和标准模式都使用相同的验证函数）
         val_metrics = validate_grouped(
             grouped_model, participant_head, session_head, val_loader, device,
             task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
@@ -1151,14 +1380,23 @@ def main() -> None:
 
         if is_best:
             best_metric = primary
-            save_checkpoint(
-                run_dirs["checkpoints"] / "best.pt",
-                grouped_model, optimizer, epoch, best_metric,
-                extra={
-                    "participant_head_state_dict": participant_head.state_dict(),
-                    "session_head_state_dict": session_head.state_dict(),
-                },
-            )
+            # 保存检查点（MTL模式保存整个优化模型）
+            if enable_mtl:
+                save_checkpoint(
+                    run_dirs["checkpoints"] / "best.pt",
+                    optimized_model, optimizer, epoch, best_metric,
+                    extra={"enable_mtl": True},
+                )
+            else:
+                save_checkpoint(
+                    run_dirs["checkpoints"] / "best.pt",
+                    grouped_model, optimizer, epoch, best_metric,
+                    extra={
+                        "participant_head_state_dict": participant_head.state_dict(),
+                        "session_head_state_dict": session_head.state_dict(),
+                        "enable_mtl": False,
+                    },
+                )
             log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
             meta.update_best(epoch, val_metrics)
 
@@ -1172,12 +1410,20 @@ def main() -> None:
     log.info(f"Training complete. Best {metric_name}={best_metric:.4f}, time={_fmt_duration(total_time)}")
 
     log.info("Loading best checkpoint for submission generation ...")
-    state = load_checkpoint(run_dirs["checkpoints"] / "best.pt", grouped_model, optimizer=None)
-    participant_head.load_state_dict(state["participant_head_state_dict"])
-    session_head.load_state_dict(state["session_head_state_dict"])
-    grouped_model.to(device)
-    participant_head.to(device)
-    session_head.to(device)
+    state = load_checkpoint(run_dirs["checkpoints"] / "best.pt",
+                           optimized_model if enable_mtl else grouped_model,
+                           optimizer=None)
+
+    if enable_mtl:
+        # MTL模式：整个优化模型已加载
+        optimized_model.to(device)
+    else:
+        # 标准模式：需要加载各个头
+        participant_head.load_state_dict(state["participant_head_state_dict"])
+        session_head.load_state_dict(state["session_head_state_dict"])
+        grouped_model.to(device)
+        participant_head.to(device)
+        session_head.to(device)
 
     submission_level = cfg.get("submission_level", "participant")
     decode_method = _normalize_decode_method(cfg.get("decode_method", "expectation"))

@@ -1,0 +1,116 @@
+# A2 任务第一阶段优化配置
+# 基于 default.yaml，增加优化参数
+
+feature_root: ../train
+manifest_dir: ../manifests
+output_dir: ../output/a2
+
+feature_selection:
+  audio_features:
+    - mel_mfcc
+    - vad
+    - egemaps
+    - ssl_embed
+  video_features:
+    - headpose_geom
+    - face_behavior
+    - qc_stats
+    - vad_agg
+    - body_pose
+    - global_motion
+    - vision_ssl_embed
+  audio_ssl_model_tag: chinese-hubert-large
+  video_ssl_model_tag: vit-mae-base
+
+mask_policy: and_core
+core_audio: [mel_mfcc, ssl_embed]
+core_video: [vision_ssl_embed, qc_stats]
+
+# ============================================================
+# 模型架构参数
+# ============================================================
+d_adapter: 64
+d_model: 256
+tcn_layers: 6
+tcn_kernel_size: 3
+asp_alpha: 0.5
+asp_beta: 0.5
+dropout: 0.2
+d_shared: 256
+
+aggregator: mlp
+use_coral: true                   # 使用 CORAL head（改进的序数回归）
+
+# ============================================================
+# 辅助属性（Auxiliary Attributes）- 已有功能
+# ============================================================
+# 这是项目原本就支持的功能，数据已在 CSV manifest 中
+# 包含5个维度：家庭结构、独生子女、父母偏爱、成绩变动、情绪变动
+use_aux_attrs: true              # 启用辅助属性编码
+aux_embed_dim: 8                 # 每个属性的 embedding 维度
+
+# ============================================================
+# 第一阶段优化：序数回归增强损失（CORN + QWK）
+# ============================================================
+use_corn_loss: 1                  # 启用 CORN 条件序数损失（保证单调性）
+use_qwk_aux: 1                    # 启用可微 QWK 辅助损失（直接优化评价指标）
+qwk_weight: 0.3                   # QWK 损失权重
+
+# ============================================================
+# 不确定性加权多任务学习（Auxiliary Tasks）- 新增功能
+# ============================================================
+# 注意：这与上面的"辅助属性"不同！
+# 辅助属性 = 静态背景信息（已有数据）
+# 辅助任务 = 额外预测任务（需要额外标签）
+#
+# 辅助任务包括：
+# - 情绪维度预测：valence（愉悦度）和 arousal（激活度）
+# - 情感分类：4类基础情绪（快乐/悲伤/愤怒/中性）
+# - AU预测：12个关键面部动作单元
+#
+# 方案B（完整MTL）：启用辅助任务和不确定性加权
+use_uncertainty_weighting: true   # 启用不确定性加权（自动平衡任务权重）
+enable_auxiliary_tasks: true      # 启用辅助任务
+enable_emotion_dims: true         # 情绪维度预测（从DASS-21推导）
+enable_emotion_cls: true          # 情感分类（从DASS-21推导）
+enable_au_pred: false             # 面部AU预测（暂不启用，需要OpenFace数据）
+
+# 固定任务权重（仅在 use_uncertainty_weighting=false 时生效）
+session_loss_weight: 0.5
+session_type_loss_weight: 0.15
+emotion_dims_weight: 0.2          # 情绪维度损失权重
+emotion_cls_weight: 0.15          # 情感分类损失权重
+au_pred_weight: 0.1               # AU预测损失权重
+
+# ============================================================
+# 训练超参数
+# ============================================================
+batch_size: 64
+lr: 0.001
+weight_decay: 0.01
+warmup_epochs: 3
+epochs: 40
+seed: 325799
+num_workers: 8
+preload_workers: 16
+amp: true
+preload: true
+use_hdf5: true
+grad_clip: 1.0
+use_pos_weight: true
+patience: 99
+early_stop_metric: val_loss       # A2使用验证损失作为早停依据
+
+# ============================================================
+# 数据增强与正则化
+# ============================================================
+label_smoothing: 0.05             # 标签平滑
+feature_noise_std: 0.01           # 特征高斯噪声
+session_drop_prob: 0.1            # 会话级dropout
+
+# ============================================================
+# 提交配置
+# ============================================================
+submission_level: participant
+decode_method: auto
+run_inference_after_train: true

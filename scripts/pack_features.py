@@ -36,11 +36,16 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
-def pack_dataset(manifest_path, feature_root, split, output_path, compression='gzip'):
+def pack_dataset(manifest_path, feature_root, split, output_path, compression='gzip', config_dict=None):
     """将dataset打包成HDF5"""
 
     # 创建配置
-    cfg = FeatureConfig(feature_root=feature_root)
+    if config_dict is not None:
+        # Extract only feature_selection params and override feature_root
+        feature_selection = config_dict.get('feature_selection', {})
+        cfg = FeatureConfig(**feature_selection, feature_root=feature_root)
+    else:
+        cfg = FeatureConfig(feature_root=feature_root)
 
     # 加载dataset
     log.info(f"Loading dataset from {manifest_path}")
@@ -164,12 +169,19 @@ Examples:
 
     args = parser.parse_args()
 
+    config_dict = None
+    if args.config:
+        import yaml
+        with open(args.config) as f:
+            config_dict = yaml.safe_load(f)
+
     pack_dataset(
         manifest_path=args.manifest,
         feature_root=args.feature_root,
         split=args.split,
         output_path=args.output,
         compression=args.compression,
+        config_dict=config_dict,
     )
 
 

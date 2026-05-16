@@ -293,6 +293,84 @@ class GroupedParticipantDataset(Dataset):
             return self._apply_session_dropout(sample)
         return sample
 
+    def _load_emotion_dims(self, y_a1: np.ndarray) -> np.ndarray:
+        """
+        从DASS-21分数推导情绪维度（valence/arousal）
+
+        参数:
+            y_a1: [depression, anxiety, stress] 范围 [0, 3]
+
+        返回:
+            (2,) [valence, arousal] 范围 [0, 1]
+            - valence（愉悦度）：抑郁分数越高，valence越低
+            - arousal（激活度）：焦虑分数越高，arousal越高
+        """
+        depression = float(y_a1[0])
+        anxiety = float(y_a1[1])
+
+        # 归一化到 [0, 1]，处理缺失值
+        if depression < 0:
+            valence = 0.5  # 缺失值用中性值
+        else:
+            valence = 1.0 - (depression / 3.0)
+
+        if anxiety < 0:
+            arousal = 0.5
+        else:
+            arousal = anxiety / 3.0
+
+        return np.array([valence, arousal], dtype=np.float32)
+
+    def _load_emotion_cls(self, y_a1: np.ndarray) -> int:
+        """
+        从DASS-21分数推导情感分类
+
+        参数:
+            y_a1: [depression, anxiety, stress] 范围 [0, 3]
+
+        返回:
+            0=快乐, 1=悲伤, 2=愤怒, 3=中性
+        """
+        depression = float(y_a1[0])
+        anxiety = float(y_a1[1])
+        stress = float(y_a1[2])
+
+        # 处理缺失值
+        if depression < 0 or anxiety < 0 or stress < 0:
+            return 3  # 缺失值归为中性
+
+        # 基于临床阈值的简单规则
+        # DASS-21 正常范围：抑郁<0.5, 焦虑<0.4, 压力<0.6
+        if depression > 1.5:  # 中度以上抑郁
+            return 1  # 悲伤
+        elif stress > 1.5:  # 中度以上压力
+            return 2  # 愤怒
+        elif depression < 0.5 and anxiety < 0.4 and stress < 0.6:  # 正常范围
+            return 0  # 快乐
+        else:
+            return 3  # 中性
+
+    def _load_au_labels(self, sess_row: pd.Series | None) -> np.ndarray:
+        """
+        从OpenFace特征提取AU标签（占位实现）
+
+        参数:
+            sess_row: 会话行数据
+
+        返回:
+            (12,) 12个关键AU的激活强度 [0-5]
+
+        注意：
+            这是占位实现，返回全零。实际使用需要从OpenFace输出文件读取AU强度。
+            关键AU列表（基于情绪识别文献）：
+            AU01(内眉提升), AU02(外眉提升), AU04(眉头皱起), AU05(上眼睑提升),
+            AU06(脸颊提升), AU07(眼睑收紧), AU09(鼻皱), AU12(嘴角上扬),
+            AU15(嘴角下拉), AU17(下巴提升), AU20(嘴角拉伸), AU25(嘴唇分开)
+        """
+        # TODO: 实际实现需要读取OpenFace输出文件
+        # 示例路径: self.root / school / cls / pid / "video" / "openface" / f"{session}_au.csv"
+        return np.zeros(12, dtype=np.float32)
+
     def _load_participant(self, idx: int) -> dict[str, Any]:
         """
         加载一个参与者的所有会话
@@ -319,7 +397,7 @@ class GroupedParticipantDataset(Dataset):
                 sessions_data.append(None)
                 session_valid.append(False)
 
-        return {
+        sample = {
             "sessions": sessions_data,  # 长度为4的列表，元素为会话字典或None
             "session_valid": np.array(session_valid, dtype=bool),  # [True, True, False, True]表示第3个会话缺失
             "y_a1": torch.from_numpy(info["y_a1"]),
@@ -330,6 +408,23 @@ class GroupedParticipantDataset(Dataset):
             "anon_class": info["anon_class"],
             "session_names": SESSIONS,
         }
+
+        # 添加辅助任务标签（仅训练集需要）
+        if self.split == "train":
+            # 使用第一个有效会话的行数据（用于AU标签）
+            first_sess_row = None
+            for sess_name in SESSIONS:
+                if sess_name in info["sess_rows"]:
+                    first_sess_row = info["sess_rows"][sess_name]
+                    break
+
+            sample["auxiliary_targets"] = {
+                "emotion_dims": torch.from_numpy(self._load_emotion_dims(info["y_a1"])),
+                "emotion_cls": torch.tensor(self._load_emotion_cls(info["y_a1"]), dtype=torch.long),
+                "au_labels": torch.from_numpy(self._load_au_labels(first_sess_row)),
+            }
+
+        return sample
 
     def _apply_session_dropout(self, sample: dict[str, Any]) -> dict[str, Any]:
         """
@@ -556,7 +651,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
     # 返回两层结构：flat_batch（会话级）+ participant级元信息
-    return {
+    result = {
         "flat_batch": flat_batch,  # 展平的会话数据，形状(n_flat, ...)
         "participant_y_a1": torch.stack([b["y_a1"] for b in batch]),  # 参与者级标签，形状(B, 3)
         "participant_y_a2": torch.stack([b["y_a2"] for b in batch]),  # 形状(B, 21)
@@ -570,6 +665,16 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "flat_sessions": flat_sess_names,  # 展平后的会话名称列表
         "flat_pids": flat_pids,  # 展平后的参与者ID列表
     }
+
+    # 添加辅助任务标签（如果存在）
+    if "auxiliary_targets" in batch[0]:
+        result["auxiliary_targets"] = {
+            "emotion_dims": torch.stack([b["auxiliary_targets"]["emotion_dims"] for b in batch]),  # (B, 2)
+            "emotion_cls": torch.stack([b["auxiliary_targets"]["emotion_cls"] for b in batch]),  # (B,)
+            "au_labels": torch.stack([b["auxiliary_targets"]["au_labels"] for b in batch]),  # (B, 12)
+        }
+
+    return result
 
 
 def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
