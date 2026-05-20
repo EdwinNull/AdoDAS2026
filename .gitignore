@@ -19,7 +19,6 @@ env/
 Thumbs.db
 
 # Project artifacts
-result.csv
 *.log
 runs/
 checkpoints/
