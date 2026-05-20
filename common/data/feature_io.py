@@ -52,7 +52,7 @@ def load_sequence(
     session: str,
     model_tag: str | None = None,
 ) -> SequenceData:
-    parts = [root, anon_school, anon_class, anon_pid, modality, feature_set] # 构建路径
+    parts = [root, split, anon_school, anon_class, anon_pid, modality, feature_set] # 构建路径
     if model_tag is not None:
         parts.append(model_tag) # SSL特征需要多一层目录
     parts.append(session)
