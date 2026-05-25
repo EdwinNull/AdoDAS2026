@@ -1,6 +1,6 @@
-feature_root: ..
-manifest_dir: ../manifests
-output_dir: ../output/a2
+feature_root: /data1/AdoDas
+manifest_dir: /data1/AdoDas
+output_dir: /data1/AdoDas/output
 
 feature_selection:
   audio_features:
@@ -46,7 +46,7 @@ num_workers: 8
 preload_workers: 16
 amp: true
 preload: true
-use_hdf5: true
+use_hdf5: false
 grad_clip: 1.0
 use_pos_weight: true
 patience: 10

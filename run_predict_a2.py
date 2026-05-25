@@ -42,15 +42,10 @@ from common.runner import _decode_a2_logits, _normalize_decode_method
 
 log = logging.getLogger("predict_a2")
 
-BEST_RUN_DIR = Path(
-    "/home/um202376818/wangyiming/output/a2/runs/"
-    "a2__grouped__coral__a-base-mel_mfcc+vad+egemaps__a-ssl-chinese-hubert-large"
-    "__v-base-headpose+facebeh+qc+vadagg__v-ssl-vit-mae-base__mask-andcore"
-    "__pw_pwthr_autodecode_thrcalib__seed42__20260421_213139"
-)
-DEFAULT_TEST_ROOT = Path("/home/um202376818/wangyiming/test")
-DEFAULT_OUTPUT_CSV = Path("/home/um202376818/wangyiming/result_pred.csv")
-TEMPLATE_CSV = Path("/home/um202376818/wangyiming/result.csv")
+BEST_RUN_DIR = Path("/data1/AdoDas/output/a2/runs/best_run")
+DEFAULT_TEST_ROOT = Path("/data1/AdoDas/Test/test/test_hidden")
+DEFAULT_OUTPUT_CSV = Path("/data1/AdoDas/output/result_pred.csv")
+TEMPLATE_CSV = Path("/data1/AdoDas/output/result.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +58,8 @@ SCH_RE = re.compile(r"^SCH_\d+$")
 
 
 def discover_manifest(test_root: Path) -> tuple[pd.DataFrame, dict[str, Path]]:
-    """Walk the multi-package test tree, return a manifest DataFrame and
-    a mapping from school id to the package root that contains its sessions.
+    """Walk the test tree, return a manifest DataFrame and
+    a mapping from school id to the root that contains its sessions.
 
     Each row is one (school, class, pid, session) — same shape as the training
     manifests consumed by GroupedParticipantDataset.
@@ -72,31 +67,21 @@ def discover_manifest(test_root: Path) -> tuple[pd.DataFrame, dict[str, Path]]:
     rows: list[dict[str, str]] = []
     school_to_root: dict[str, Path] = {}
 
-    pkg_dirs = sorted(p for p in test_root.iterdir() if p.is_dir() and SCH_RE.match(p.name))
-    if not pkg_dirs:
+    sch_dirs = sorted(p for p in test_root.iterdir() if p.is_dir() and SCH_RE.match(p.name))
+    if not sch_dirs:
         raise FileNotFoundError(f"No SCH_xxx packages under {test_root}")
 
-    log.info(f"Discovered {len(pkg_dirs)} test packages under {test_root}")
-    for pkg in pkg_dirs:
-        inner = pkg / "test_hidden" / pkg.name
-        if not inner.is_dir():
-            log.warning(f"  skip {pkg.name}: missing {inner}")
-            continue
-        # Per-package root for load_sequence: it concatenates
-        # root/school/class/pid/modality/feature/(model_tag/)session
-        # So self.root must equal pkg / "test_hidden".
-        school_root = pkg / "test_hidden"
-        school_to_root[pkg.name] = school_root
+    log.info(f"Discovered {len(sch_dirs)} schools under {test_root}")
+    for sch in sch_dirs:
+        school_to_root[sch.name] = test_root
 
-        cls_dirs = sorted(d for d in inner.iterdir() if d.is_dir() and CLS_RE.match(d.name))
+        cls_dirs = sorted(d for d in sch.iterdir() if d.is_dir() and CLS_RE.match(d.name))
         n_pid = 0
         n_sess = 0
         for cls in cls_dirs:
             pid_dirs = sorted(d for d in cls.iterdir() if d.is_dir() and PID_RE.match(d.name))
             for pid in pid_dirs:
                 n_pid += 1
-                # Sessions exist under any feature subdir; probe mel_mfcc which
-                # is always produced. Fall back to audio/vad if needed.
                 probe_dirs = [
                     pid / "audio" / "mel_mfcc",
                     pid / "audio" / "vad",
@@ -112,13 +97,13 @@ def discover_manifest(test_root: Path) -> tuple[pd.DataFrame, dict[str, Path]]:
                             break
                 for sess in sorted(sessions):
                     rows.append({
-                        "anon_school": pkg.name,
+                        "anon_school": sch.name,
                         "anon_class": cls.name,
                         "anon_pid": pid.name,
                         "session": sess,
                     })
                     n_sess += 1
-        log.info(f"  {pkg.name}: {len(cls_dirs)} classes, {n_pid} participants, {n_sess} sessions")
+        log.info(f"  {sch.name}: {len(cls_dirs)} classes, {n_pid} participants, {n_sess} sessions")
 
     if not rows:
         raise RuntimeError(f"No sessions discovered under {test_root}")

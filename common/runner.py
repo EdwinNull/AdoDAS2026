@@ -1036,8 +1036,8 @@ def main() -> None:
     seed_everything(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    output_root = Path(cfg.get("output_dir", "/media/k3nwong/Data1/test/train/output"))
-    manifest_dir = Path(cfg.get("manifest_dir", "/media/k3nwong/Data1/test/outputs/data"))
+    output_root = Path(cfg.get("output_dir", "/data1/AdoDas/output"))
+    manifest_dir = Path(cfg.get("manifest_dir", "/data1/AdoDas"))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = build_run_name(cfg, task, timestamp, training_mode="grouped_participant")
@@ -1096,10 +1096,10 @@ def main() -> None:
     else:
         log.info("Using original scattered datasets")
         train_ds = GroupedParticipantDataset(
-            manifest_dir / "train.csv", feat_cfg, split="train",
+            manifest_dir / "Train" / "train.csv", feat_cfg, split="train",
             session_drop_prob=cfg.get("session_drop_prob", 0.1),
         )
-        val_ds = GroupedParticipantDataset(manifest_dir / "val.csv", feat_cfg, split="val")
+        val_ds = GroupedParticipantDataset(manifest_dir / "Val" / "val.csv", feat_cfg, split="val")
 
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
@@ -1180,7 +1180,7 @@ def main() -> None:
     session_head_input_dim = bb_cfg.d_shared
 
     if task == "a1":
-        bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
+        bias_init = _compute_bias_init_a1(manifest_dir / "Train" / "train.csv")
         participant_head = A1Head(participant_head_input_dim, bias_init=bias_init).to(device)
         session_head = A1Head(session_head_input_dim, bias_init=bias_init).to(device)
     else:
@@ -1242,11 +1242,11 @@ def main() -> None:
     pos_weight_t = None
     if cfg.get("use_pos_weight", True):
         if task == "a1":
-            pw = _compute_pos_weight_a1(manifest_dir / "train.csv")
+            pw = _compute_pos_weight_a1(manifest_dir / "Train" / "train.csv")
             pos_weight_t = torch.tensor(pw, dtype=torch.float32, device=device)
             log.info(f"pos_weight [D/A/S]: {pw[0]:.2f} / {pw[1]:.2f} / {pw[2]:.2f}")
         else:
-            pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
+            pos_weight_t = compute_a2_pos_weight(manifest_dir / "Train" / "train.csv").to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
     # 优化器参数
@@ -1549,8 +1549,9 @@ def main() -> None:
 
     if bool(cfg.get("run_inference_after_train", False)):
         run_dirs["submissions"].mkdir(parents=True, exist_ok=True)
+        _MANIFEST_SPLIT_DIR = {"val": "Val", "test_hidden": "Test"}
         for split_name in ("val", "test_hidden"):
-            manifest_path = manifest_dir / f"{split_name}.csv"
+            manifest_path = manifest_dir / _MANIFEST_SPLIT_DIR[split_name] / f"{split_name}.csv"
             if not manifest_path.exists():
                 continue
             ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=split_name)

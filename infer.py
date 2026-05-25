@@ -84,8 +84,9 @@ def main() -> None:
     run_dir = checkpoint_path.parent.parent
     setup_logging(run_dir / "logs", f"infer_{args.task}")
 
-    manifest_dir = Path(cfg.get("manifest_dir", "/media/k3nwong/Data1/test/outputs/data"))
-    manifest_path = Path(args.manifest) if args.manifest else manifest_dir / f"{args.split}.csv"
+    _MANIFEST_SPLIT_DIR = {"train": "Train", "val": "Val", "test_hidden": "Test"}
+    manifest_dir = Path(cfg.get("manifest_dir", "/data1/AdoDas"))
+    manifest_path = Path(args.manifest) if args.manifest else manifest_dir / _MANIFEST_SPLIT_DIR.get(args.split, args.split) / f"{args.split}.csv"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 

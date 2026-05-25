@@ -1,6 +1,6 @@
-feature_root: ..
-manifest_dir: ../manifests
-output_dir: ../output/a1
+feature_root: /data1/AdoDas
+manifest_dir: /data1/AdoDas
+output_dir: /data1/AdoDas/output
 
 feature_selection:
   audio_features:

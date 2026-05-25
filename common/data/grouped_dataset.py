@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from .dataset import (
     SESSIONS, SESSION_TO_IDX, ITEM_COLS, A1_COLS, AUX_ATTR_COLS,
-    FeatureConfig, align_to_grid,
+    FeatureConfig, SPLIT_DATA_PATH, align_to_grid,
 )
 from .feature_io import SequenceData, load_egemaps_pooled, load_sequence
 
@@ -39,16 +39,7 @@ class GroupedParticipantDataset(Dataset):
         self.cfg = cfg
         self.split = split
         self.session_drop_prob = float(session_drop_prob)
-
-        # 根据 split 动态选择特征根目录：
-        # feature_root 通常指向训练集目录（如 ../train），
-        # 验证集/测试集特征在同级的 ../val、../test_hidden 等目录下。
-        configured_root = Path(cfg.feature_root)
-        split_root = configured_root.parent / split
-        if split_root.is_dir():
-            self.root = split_root
-        else:
-            self.root = configured_root
+        self.root = Path(cfg.feature_root) / SPLIT_DATA_PATH.get(split, split)
 
         manifest = pd.read_csv(manifest_path)
 
@@ -103,7 +94,7 @@ class GroupedParticipantDataset(Dataset):
             dims[name] = seq.features.shape[1]
         if "egemaps" in self.cfg.audio_pooled_features:
             eg = load_egemaps_pooled(
-                self.root, self.split,
+                self.root, "",
                 str(row["anon_school"]), str(row["anon_class"]),
                 str(row["anon_pid"]), str(row["session"]),
             )
@@ -124,7 +115,7 @@ class GroupedParticipantDataset(Dataset):
                 tag = cfg.video_ssl_model_tag
             try:
                 seq = load_sequence(
-                    self.root, self.split,
+                    self.root, "",
                     str(row["anon_school"]), str(row["anon_class"]),
                     str(row["anon_pid"]),
                     modality, feat_name, str(row["session"]),
@@ -234,7 +225,7 @@ class GroupedParticipantDataset(Dataset):
             pooled_presence: dict[str, bool] = {}
             if "egemaps" in cfg.audio_pooled_features:
                 egemaps = load_egemaps_pooled(
-                    self.root, self.split,
+                    self.root, "",
                     str(row["anon_school"]), str(row["anon_class"]),
                     str(row["anon_pid"]), str(row["session"]),
                 )

@@ -26,6 +26,13 @@ AUX_ATTR_COLS = ["Family structure", "Only child status", "Parental favoritism",
                  "Academic performance change", "Emotional state change"]
 POOLED_AUDIO_FEATURES = {"egemaps"}
 
+# 逻辑 split 名 → feature_root 下的相对子路径
+SPLIT_DATA_PATH = {
+    "train": "Train/train/train",
+    "val": "Val/val/val",
+    "test_hidden": "Test/test/test_hidden",
+}
+
 '''
 此文件实现的核心功能：
 1. 多模态对齐
@@ -35,7 +42,7 @@ POOLED_AUDIO_FEATURES = {"egemaps"}
 
 @dataclass
 class FeatureConfig:
-    feature_root: str = "/media/k3nwong/Data1/test/outputs/pipeline/anonymized" 
+    feature_root: str = "/data1/AdoDas"
     audio_features: list[str] = field(
         default_factory=lambda: ["mel_mfcc", "vad", "egemaps", "ssl_embed"]
     )
@@ -124,13 +131,7 @@ class MultimodalDataset(Dataset):
     ) -> None:
         self.cfg = cfg
         self.split = split
-        # 根据 split 动态选择特征根目录
-        configured_root = Path(cfg.feature_root)
-        split_root = configured_root.parent / split
-        if split_root.is_dir():
-            self.root = split_root
-        else:
-            self.root = configured_root
+        self.root = Path(cfg.feature_root) / SPLIT_DATA_PATH.get(split, split)
 
         # 加载manifest，检查必要的列
         self.manifest = pd.read_csv(manifest_path)
@@ -161,7 +162,7 @@ class MultimodalDataset(Dataset):
         # 对于池化特征，直接加载并获取维度
         if "egemaps" in self.cfg.audio_pooled_features:
             eg = load_egemaps_pooled(
-                self.root, self.split,
+                self.root, "",
                 str(row["anon_school"]), str(row["anon_class"]),
                 str(row["anon_pid"]), str(row["session"]),
             )
@@ -284,7 +285,7 @@ class MultimodalDataset(Dataset):
                 tag = cfg.video_ssl_model_tag
             try:
                 seq = load_sequence(
-                    self.root, self.split,
+                    self.root, "",
                     str(row["anon_school"]), str(row["anon_class"]),
                     str(row["anon_pid"]),
                     modality, feat_name, str(row["session"]),
@@ -387,7 +388,7 @@ class MultimodalDataset(Dataset):
         pooled_presence: dict[str, bool] = {}
         if "egemaps" in cfg.audio_pooled_features:
             egemaps = load_egemaps_pooled(
-                self.root, self.split,
+                self.root, "",
                 str(row["anon_school"]), str(row["anon_class"]),
                 str(row["anon_pid"]), str(row["session"]),
             )
