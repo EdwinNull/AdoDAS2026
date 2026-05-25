@@ -34,7 +34,8 @@ class GroupedParticipantDataset(Dataset):
         manifest_path: str | Path,
         cfg: FeatureConfig,
         split: str,
-        session_drop_prob: float = 0.0,  # 训练时随机丢弃会话的概率，用于数据增强
+        session_drop_prob: float = 0.0,
+        max_participants: int = 0,
     ) -> None:
         self.cfg = cfg
         self.split = split
@@ -67,11 +68,15 @@ class GroupedParticipantDataset(Dataset):
                 "anon_school": str(school),
                 "anon_class": str(cls),
                 "anon_pid": str(pid),
-                "sess_rows": sess_rows,  # 该参与者的所有会话元信息
+                "sess_rows": sess_rows,
                 "y_a1": y_a1,
                 "y_a2": y_a2,
                 "aux_attrs": aux_attrs,
             })
+
+        if max_participants > 0 and len(self.participants) > max_participants:
+            self.participants = self.participants[:max_participants]
+            log.info(f"Truncated dataset to {max_participants} participants (debug mode)")
 
         self._feature_dims: dict[str, int] | None = None
         self._cache: list[dict | None] | None = None

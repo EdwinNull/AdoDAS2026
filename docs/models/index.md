@@ -5,8 +5,9 @@
 ## 文档列表
 
 1. [mtcn_backbone.md](mtcn_backbone.md) - 多模态TCN骨干网络详解
-2. [heads.md](heads.md) - 任务预测头详解
-3. [grouped_model.md](grouped_model.md) - 参与者聚合模型详解
+2. [heads.md](heads.md) - 任务预测头详解 (含 AuxAttributeHeads)
+3. [grouped_model.md](grouped_model.md) - 参与者聚合模型详解 (含 LUPI 扩展)
+4. [../lupi/](../lupi/) - LUPI 机制详解 (Phase 1/2)
 
 ## 模型架构总览
 
@@ -29,6 +30,11 @@
 │  ├── A1Head (三分类二元分类)                                                 │
 │  ├── A2OrdinalHead (序数回归)                                                │
 │  └── CORALHead (Consistent Rank Logits)                                     │
+│                                                                             │
+│  LUPI Extensions                                                             │
+│  ├── AuxAttributeHeads (辅助属性预测头, 输入端)                               │
+│  ├── AuxAttributeEncoder (辅助属性编码器, 输出端)                              │
+│  └── _compute_aux_consistency_weight (样本加权, Phase 2)                      │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```

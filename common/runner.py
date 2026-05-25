@@ -24,7 +24,7 @@ from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
 from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
 from .data.hdf5_dataset import HDF5GroupedDataset
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
-from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss
+from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss, AuxAttributeHeads, aux_attribute_loss
 from .models.grouped_model import GroupedModel, CORALHead
 from .models.phase1_integration import OptimizedGroupedModel, compute_optimized_loss
 from .utils.seed import seed_everything
@@ -112,10 +112,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--amp", type=int, default=None)
     p.add_argument("--preload", type=int, default=None)
+    p.add_argument("--max_participants", type=int, default=None)
     p.add_argument("--use_hdf5", type=int, default=None, help="1=use HDF5 packed dataset")
     p.add_argument("--patience", type=int, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
+
+    # LUPI 控制参数
+    p.add_argument("--aux_lupi_enabled", type=int, default=None, help="1=enable LUPI aux supervision")
+    p.add_argument("--aux_lupi_phase1", type=int, default=None, help="1=enable Phase 1 aux attr heads")
+    p.add_argument("--aux_lupi_phase2", type=int, default=None, help="1=enable Phase 2 sample reweighting")
 
     return p.parse_args()
 
@@ -297,6 +303,40 @@ def _select_best_a2_result(results: dict[str, dict[str, float | np.ndarray | str
     return best_name, results[best_name]
 
 
+def _compute_aux_consistency_weight(
+    batch: dict, labels: torch.Tensor, device: torch.device,
+    w_low: float = 0.7, w_high: float = 1.2, w_mid: float = 1.0,
+) -> torch.Tensor:
+    """根据 aux_emotional 与 DASS 标签的一致性计算样本权重。
+
+    aux_emotional 取值: 1=变好, 2=无变化, 3=变差, 缺失=-1
+    一致（高权重）: DASS阳性+情绪变差 或 DASS阴性+情绪变好
+    冲突（低权重）: DASS阳性+情绪变好 或 DASS阴性+情绪变差
+    中性/缺失: 中权重
+    """
+    weights = torch.full((labels.shape[0],), w_mid, device=device)
+    aux_attrs = batch.get("participant_aux_attrs")
+    if aux_attrs is None:
+        return weights
+    aux_emo = aux_attrs[:, 4].to(device).long()  # 第5列：Emotional state change
+
+    # 判断标签是否阳性
+    if labels.dim() == 2 and labels.shape[1] == 3:  # A1: (B, 3)
+        label_pos = labels.sum(dim=1) > 0
+    else:  # A2: (B, 21)
+        label_pos = labels.float().mean(dim=1) > 1.0
+
+    aux_worse = (aux_emo == 3)
+    aux_better = (aux_emo == 1)
+
+    consistent = (label_pos & aux_worse) | ((~label_pos) & aux_better)
+    conflict = (label_pos & aux_better) | ((~label_pos) & aux_worse)
+
+    weights[consistent] = w_high
+    weights[conflict] = w_low
+    return weights
+
+
 def _compute_pos_weight_a1(manifest_path: Path) -> list[float]:
     df = pd.read_csv(manifest_path)
     weights = []
@@ -359,6 +399,11 @@ def train_one_epoch_grouped(
     use_corn_loss: bool = False,
     use_qwk_aux: bool = False,
     qwk_weight: float = 0.3,
+    # LUPI 参数
+    aux_lupi_weights: dict[str, float] | None = None,
+    phase2_reweight: bool = False,
+    phase2_w_low: float = 0.7,
+    phase2_w_high: float = 1.2,
 ) -> float:
     grouped_model.train()
     participant_head.train()
@@ -414,6 +459,17 @@ def train_one_epoch_grouped(
                     clip=clip,
                     soft_f1_weight=soft_f1_weight,
                 )
+                # Phase 2: per-sample reweight by aux consistency (additive)
+                rew_loss_a1 = p_logits.new_zeros(())
+                if phase2_reweight:
+                    sample_w = _compute_aux_consistency_weight(
+                        batch, targets, device, phase2_w_low, phase2_w_high,
+                    )
+                    per_sample = F.binary_cross_entropy_with_logits(
+                        p_logits.float(), targets.float(),
+                        reduction="none", pos_weight=pos_weight,
+                    ).mean(dim=-1)
+                    rew_loss_a1 = (per_sample * sample_w).mean()
             else:
                 main_loss = a2_ordinal_loss(
                     p_logits, targets,
@@ -423,6 +479,17 @@ def train_one_epoch_grouped(
                     use_qwk=use_qwk_aux,
                     qwk_weight=qwk_weight,
                 )
+                rew_loss_a2 = p_logits.new_zeros(())
+                if phase2_reweight:
+                    sample_w = _compute_aux_consistency_weight(
+                        batch, targets, device, phase2_w_low, phase2_w_high,
+                    )
+                    tgt = A2OrdinalHead.build_ordinal_targets(targets)
+                    per_sample = F.binary_cross_entropy_with_logits(
+                        p_logits.float(), tgt.float(),
+                        reduction="none", pos_weight=pos_weight,
+                    ).mean(dim=(-1, -2))
+                    rew_loss_a2 = (per_sample * sample_w).mean()
 
             if has_valid_sessions:
                 s_logits = session_head(out["session_reprs"])[valid_session_mask]
@@ -457,7 +524,16 @@ def train_one_epoch_grouped(
                 sess_loss = p_logits.new_zeros(())
                 type_loss = p_logits.new_zeros(())
 
-            loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
+            # LUPI Phase 1: 辅助属性预测损失
+            aux_loss = p_logits.new_zeros(())
+            if out.get("aux_logits") is not None and aux_attrs is not None:
+                aux_loss, aux_acc = aux_attribute_loss(
+                    out["aux_logits"], aux_attrs, weights=aux_lupi_weights,
+                )
+
+            loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss + aux_loss
+            if phase2_reweight:
+                loss = loss + 0.3 * (rew_loss_a1 if task == "a1" else rew_loss_a2)
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -516,6 +592,11 @@ def train_one_epoch_mtl(
     emotion_dims_weight: float = 0.2,
     emotion_cls_weight: float = 0.15,
     au_pred_weight: float = 0.1,
+    # LUPI
+    aux_lupi_weights: dict[str, float] | None = None,
+    phase2_reweight: bool = False,
+    phase2_w_low: float = 0.7,
+    phase2_w_high: float = 1.2,
 ) -> tuple[float, dict]:
     """
     使用MTL的训练循环
@@ -601,6 +682,35 @@ def train_one_epoch_mtl(
                 emotion_cls_weight=emotion_cls_weight,
                 au_pred_weight=au_pred_weight,
             )
+
+            # LUPI Phase 1: 辅助属性预测损失
+            if outputs.get("aux_logits") is not None and aux_attrs is not None:
+                aux_loss, aux_acc = aux_attribute_loss(
+                    outputs["aux_logits"], aux_attrs, weights=aux_lupi_weights,
+                )
+                loss = loss + aux_loss
+                loss_dict["aux_attr_loss"] = aux_loss.item()
+
+            # LUPI Phase 2: 样本一致性加权
+            if phase2_reweight:
+                participant_y = targets["participant_y"]
+                sample_w = _compute_aux_consistency_weight(
+                    batch, participant_y, device, phase2_w_low, phase2_w_high,
+                )
+                if task == "a1":
+                    per_sample = F.binary_cross_entropy_with_logits(
+                        outputs["participant_logits"].float(), participant_y.float(),
+                        reduction="none", pos_weight=pos_weight,
+                    ).mean(dim=-1)
+                else:
+                    tgt = A2OrdinalHead.build_ordinal_targets(participant_y)
+                    per_sample = F.binary_cross_entropy_with_logits(
+                        outputs["participant_logits"].float(), tgt.float(),
+                        reduction="none", pos_weight=pos_weight,
+                    ).mean(dim=(-1, -2))
+                rew_loss = (per_sample * sample_w).mean()
+                loss = loss + 0.3 * rew_loss
+                loss_dict["rew_main_loss"] = rew_loss.item()
 
         # 反向传播
         optimizer.zero_grad()
@@ -1033,6 +1143,20 @@ def main() -> None:
     cfg = load_config(args)
     task = cfg["task"]
 
+    # LUPI CLI 覆盖：将扁平 CLI 参数注入嵌套 aux_lupi 配置
+    _lupi_overrides = {
+        "aux_lupi_enabled": ("enabled", args.aux_lupi_enabled),
+        "aux_lupi_phase1":  ("phase1_mtl.enabled", args.aux_lupi_phase1),
+        "aux_lupi_phase2":  ("phase2_reweight.enabled", args.aux_lupi_phase2),
+    }
+    for _arg_name, (_cfg_path, _val) in _lupi_overrides.items():
+        if _val is not None:
+            _lupi = cfg.setdefault("aux_lupi", {})
+            _parts = _cfg_path.split(".")
+            for _p in _parts[:-1]:
+                _lupi = _lupi.setdefault(_p, {})
+            _lupi[_parts[-1]] = bool(_val)
+
     seed_everything(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1069,8 +1193,7 @@ def main() -> None:
 
     if use_hdf5:
         log.info("Using HDF5 packed datasets")
-        # HDF5路径：假设在feature_root的父目录
-        hdf5_dir = Path(cfg["feature_root"]).parent
+        hdf5_dir = Path(cfg.get("hdf5_dir", "/data1/AdoDas"))
         train_hdf5 = hdf5_dir / "train_packed.h5"
         val_hdf5 = hdf5_dir / "val_packed.h5"
 
@@ -1098,9 +1221,12 @@ def main() -> None:
         train_ds = GroupedParticipantDataset(
             manifest_dir / "Train" / "train.csv", feat_cfg, split="train",
             session_drop_prob=cfg.get("session_drop_prob", 0.1),
+            max_participants=max_pts,
         )
-        val_ds = GroupedParticipantDataset(manifest_dir / "Val" / "val.csv", feat_cfg, split="val")
+        val_ds = GroupedParticipantDataset(manifest_dir / "Val" / "val.csv", feat_cfg, split="val",
+                                          max_participants=max_pts)
 
+    max_pts = cfg.get("max_participants", 0) or 0
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
     log.info(f"Train: {len(train_ds)} participants, Val: {len(val_ds)} participants")
@@ -1165,12 +1291,24 @@ def main() -> None:
         aux_dim = aux_encoder.output_dim
         log.info(f"Auxiliary attributes enabled: embed_dim={aux_embed_dim}, output_dim={aux_dim}")
 
+    # 创建辅助属性预测头（LUPI Phase 1）
+    aux_heads = None
+    aux_lupi_cfg = cfg.get("aux_lupi", {})
+    if aux_lupi_cfg.get("enabled", False) and aux_lupi_cfg.get("phase1_mtl", {}).get("enabled", False):
+        aux_heads = AuxAttributeHeads(
+            d_in=bb_cfg.d_shared,
+            hidden=cfg.get("aux_lupi", {}).get("phase1_mtl", {}).get("hidden", 64),
+            dropout=cfg.get("dropout", 0.2),
+        )
+        log.info(f"LUPI Phase 1 (aux attribute heads) enabled")
+
     grouped_model = GroupedModel(
         backbone=backbone,
         d_shared=bb_cfg.d_shared,
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
         aux_encoder=aux_encoder,
+        aux_heads=aux_heads,
     ).to(device)
 
     use_coral = bool(cfg.get("use_coral", False))
@@ -1271,6 +1409,21 @@ def main() -> None:
     log.info(f"Session loss weight: {session_loss_weight}")
     log.info(f"Session type loss weight: {session_type_loss_weight}")
 
+    # LUPI Phase 1 辅助属性监督权重
+    aux_lupi_weights = None
+    if aux_lupi_cfg.get("enabled") and aux_lupi_cfg.get("phase1_mtl", {}).get("enabled"):
+        aux_lupi_weights = aux_lupi_cfg.get("phase1_mtl", {}).get("weights", {
+            "aux_family": 0.05, "aux_only_child": 0.05, "aux_favoritism": 0.05,
+            "aux_academic": 0.15, "aux_emotional": 0.20,
+        })
+        log.info(f"LUPI aux weights: {aux_lupi_weights}")
+
+    # LUPI Phase 2 样本加权
+    phase2_enabled = aux_lupi_cfg.get("enabled") and aux_lupi_cfg.get("phase2_reweight", {}).get("enabled", False)
+    if phase2_enabled:
+        phase2_cfg = aux_lupi_cfg["phase2_reweight"]
+        log.info(f"LUPI Phase 2 reweight enabled: method={phase2_cfg.get('method', 'emotional_consistency')}")
+
     patience = cfg.get("patience", 8)
     early_stop_metric = cfg.get("early_stop_metric", "val_loss")
     es_mode = "min" if early_stop_metric == "val_loss" else "max"
@@ -1320,6 +1473,10 @@ def main() -> None:
                 emotion_dims_weight=cfg.get("emotion_dims_weight", 0.2),
                 emotion_cls_weight=cfg.get("emotion_cls_weight", 0.15),
                 au_pred_weight=cfg.get("au_pred_weight", 0.1),
+                aux_lupi_weights=aux_lupi_weights,
+                phase2_reweight=phase2_enabled,
+                phase2_w_low=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_low", 0.7) if phase2_enabled else 0.7,
+                phase2_w_high=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_high", 1.2) if phase2_enabled else 1.2,
             )
             # 记录详细损失
             if epoch % 5 == 0 or epoch == 1:
@@ -1342,6 +1499,10 @@ def main() -> None:
                 use_corn_loss=bool(cfg.get("use_corn_loss", False)),
                 use_qwk_aux=bool(cfg.get("use_qwk_aux", False)),
                 qwk_weight=cfg.get("qwk_weight", 0.3),
+                aux_lupi_weights=aux_lupi_weights,
+                phase2_reweight=phase2_enabled,
+                phase2_w_low=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_low", 0.7) if phase2_enabled else 0.7,
+                phase2_w_high=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_high", 1.2) if phase2_enabled else 1.2,
             )
 
         # 验证（MTL和标准模式都使用相同的验证函数）

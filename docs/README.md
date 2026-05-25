@@ -133,12 +133,22 @@ Task Head (A1Head / A2OrdinalHead / CORALHead)
 - **早停机制**: 防止过拟合
 - **学习率调度**: Warmup + Cosine Annealing
 
+## 5. LUPI 机制（Learning Using Privileged Information）
+
+利用训练时可用但测试时不可用的辅助属性（家庭结构、独生子女等 5 个维度）：
+
+- **Phase 1 — 多任务辅助监督**：从 participant_repr 预测辅助属性，迫使 backbone 学习相关潜变量
+- **Phase 2 — 样本一致性加权**：基于 aux_emotional 与 DASS 标签一致性识别错标样本
+
+详见 `docs/AUX_LUPI_PLAN.md` 和 `docs/lupi/`。
+
 ## 文档索引
 
 - [架构总览](architecture.md) - 系统架构和模块关系
 - [数据模块](data/) - 数据处理和加载详解
 - [模型模块](models/) - 模型架构详解
 - [工具模块](utils/) - 工具函数详解
+- [LUPI 机制](lupi/) - 特权信息学习实现
 - [使用指南](guides/) - 训练和推理指南
 
 ## 快速开始
@@ -149,14 +159,55 @@ conda env create -f envs/adodas.yaml
 conda activate adodas
 ```
 
-### 训练
+### 启动脚本（推荐）
 ```bash
-python train.py --task a1 --config tasks/a1/default.yaml
+# A2 基线训练
+./run_train.sh --task a2 --preset default
+
+# A2 + LUPI Phase1+2
+./run_train.sh --task a2 --preset default --lupi p1+p2
+
+# A2 MTL 预设 + LUPI Phase2
+./run_train.sh --task a2 --preset phase1 --lupi p2
+
+# 快速调试
+./run_train.sh --task a2 --preset debug
+```
+A2 各种训练模式
+```bash
+# 基线（什么都不开）
+./run_train.sh --task a2 --preset default
+
+# 仅 LUPI Phase 1（辅助属性预测头）
+./run_train.sh --task a2 --preset default --lupi p1
+
+# 仅 LUPI Phase 2（样本一致性加权）
+./run_train.sh --task a2 --preset default --lupi p2
+
+# Phase 1 + 2 都启用
+./run_train.sh --task a2 --preset default --lupi p1+p2
+
+# 原有 MTL 预设（不开 LUPI）
+./run_train.sh --task a2 --preset phase1
+
+# 原有 MTL + LUPI Phase 2
+./run_train.sh --task a2 --preset phase1 --lupi p2
+```
+
+| preset | 配置 | 用途 |
+|--------|------|------|
+| `default` | `tasks/{task}/default.yaml` | 基线训练 |
+| `phase1` | `tasks/{task}/phase1_optimization.yaml` | MTL + 辅助任务 |
+| `debug` | default + 覆盖 | 100 人, 流式加载, 2 epochs 秒级启动 |
+
+### 直接使用 train.py
+```bash
 python train.py --task a2 --config tasks/a2/default.yaml
+python train.py --task a2 --config tasks/a2/default.yaml \
+    --aux_lupi_enabled 1 --aux_lupi_phase1 1 --aux_lupi_phase2 1
 ```
 
 ### 推理
 ```bash
-python infer.py --task a1 --checkpoint <path_to_best.pt>
-python infer.py --task a2 --checkpoint <path_to_best.pt>
+python infer.py --task a2 --checkpoint <path_to_best.pt> --split test_hidden
 ```

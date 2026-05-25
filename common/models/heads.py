@@ -476,3 +476,78 @@ def a2_ordinal_loss(
         total_loss = total_loss + qwk_weight * qwk_loss
 
     return total_loss
+
+
+# ---------------------------------------------------------------------------
+# 辅助属性预测头（LUPI Phase 1：多任务辅助监督）
+# ---------------------------------------------------------------------------
+
+_AUX_ATTR_SPEC = {
+    "aux_family":     {"num_classes": 6, "label_offset": -1},
+    "aux_only_child": {"num_classes": 2, "label_offset":  0},
+    "aux_favoritism": {"num_classes": 3, "label_offset": -1},
+    "aux_academic":   {"num_classes": 3, "label_offset": -1},
+    "aux_emotional":  {"num_classes": 3, "label_offset": -1},
+}
+_AUX_ATTR_NAMES = list(_AUX_ATTR_SPEC.keys())
+
+
+class AuxAttributeHeads(nn.Module):
+    """五个辅助属性的并行分类预测头。
+
+    从 participant_repr 预测辅助属性，提供额外训练监督（LUPI）。
+    迫使共享表示编码与心理状态相关的潜在特征。
+    """
+
+    def __init__(self, d_in: int, hidden: int = 64, dropout: float = 0.1):
+        super().__init__()
+        self.heads = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(d_in, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, spec["num_classes"]),
+            )
+            for name, spec in _AUX_ATTR_SPEC.items()
+        })
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {name: head(x) for name, head in self.heads.items()}
+
+
+def aux_attribute_loss(
+    aux_logits: dict[str, torch.Tensor],
+    aux_attrs: torch.Tensor,
+    weights: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """计算辅助属性分类损失，缺失值（-1）自动跳过。
+
+    返回:
+        total_loss: 加权总损失
+        acc_dict:   各属性有效样本准确率
+    """
+    if weights is None:
+        weights = {name: 0.05 for name in _AUX_ATTR_NAMES}
+
+    total = torch.tensor(0.0, device=aux_attrs.device, dtype=torch.float32)
+    acc_dict: dict[str, float] = {}
+
+    for i, name in enumerate(_AUX_ATTR_NAMES):
+        spec = _AUX_ATTR_SPEC[name]
+        raw_vals = aux_attrs[:, i].long()
+        valid = raw_vals >= 0
+        if valid.sum() == 0:
+            acc_dict[name] = -1.0
+            continue
+
+        labels = (raw_vals + spec["label_offset"]).clamp(min=0)
+        logits = aux_logits[name][valid]
+        targets = labels[valid]
+
+        ce = F.cross_entropy(logits, targets)
+        total = total + weights.get(name, 0.05) * ce
+
+        preds = logits.argmax(dim=-1)
+        acc_dict[name] = (preds == targets).float().mean().item()
+
+    return total, acc_dict

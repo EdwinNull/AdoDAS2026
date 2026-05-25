@@ -3,19 +3,27 @@
 将分散的特征文件打包成HDF5，加速读取
 
 使用：
-# 打包训练集
+# 打包训练集（全量）
 python scripts/pack_features.py \
-  --manifest /home/um202376818/wangyiming/manifests/train.csv \
-  --feature-root /home/um202376818/wangyiming/train \
+  --manifest /data1/AdoDas/Train/train.csv \
+  --feature-root /data1/AdoDas \
   --split train \
-  --output /home/um202376818/wangyiming/train_packed.h5
+  --output /data1/AdoDas/train_packed.h5
 
 # 打包验证集
 python scripts/pack_features.py \
-  --manifest /home/um202376818/wangyiming/manifests/val.csv \
-  --feature-root /home/um202376818/wangyiming/val \
+  --manifest /data1/AdoDas/Val/val.csv \
+  --feature-root /data1/AdoDas \
   --split val \
-  --output /home/um202376818/wangyiming/val_packed.h5
+  --output /data1/AdoDas/val_packed.h5
+
+# 仅打包前 100 人用于 debug
+python scripts/pack_features.py \
+  --manifest /data1/AdoDas/Train/train.csv \
+  --feature-root /data1/AdoDas \
+  --split train \
+  --output /data1/AdoDas/train_debug.h5 \
+  --max-participants 100
 """
 
 import argparse
@@ -36,12 +44,12 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
-def pack_dataset(manifest_path, feature_root, split, output_path, compression='gzip', config_dict=None):
+def pack_dataset(manifest_path, feature_root, split, output_path, compression='gzip',
+                 config_dict=None, max_participants=0):
     """将dataset打包成HDF5"""
 
     # 创建配置
     if config_dict is not None:
-        # Extract only feature_selection params and override feature_root
         feature_selection = config_dict.get('feature_selection', {})
         cfg = FeatureConfig(**feature_selection, feature_root=feature_root)
     else:
@@ -49,7 +57,8 @@ def pack_dataset(manifest_path, feature_root, split, output_path, compression='g
 
     # 加载dataset
     log.info(f"Loading dataset from {manifest_path}")
-    ds = GroupedParticipantDataset(manifest_path, cfg, split, session_drop_prob=0.0)
+    ds = GroupedParticipantDataset(manifest_path, cfg, split, session_drop_prob=0.0,
+                                   max_participants=max_participants)
 
     log.info(f"Packing {len(ds)} participants to {output_path}")
     log.info(f"Compression: {compression}")
@@ -146,17 +155,25 @@ def main():
 Examples:
   # Pack training set
   python scripts/pack_features.py \\
-    --manifest /home/um202376818/wangyiming/manifests/train.csv \\
-    --feature-root /home/um202376818/wangyiming/train \\
+    --manifest /data1/AdoDas/Train/train.csv \\
+    --feature-root /data1/AdoDas \\
     --split train \\
-    --output /home/um202376818/wangyiming/train_packed.h5
+    --output /data1/AdoDas/train_packed.h5
 
   # Pack validation set
   python scripts/pack_features.py \\
-    --manifest /home/um202376818/wangyiming/manifests/val.csv \\
-    --feature-root /home/um202376818/wangyiming/val \\
+    --manifest /data1/AdoDas/Val/val.csv \\
+    --feature-root /data1/AdoDas \\
     --split val \\
-    --output /home/um202376818/wangyiming/val_packed.h5
+    --output /data1/AdoDas/val_packed.h5
+
+  # Debug subset (100 participants only)
+  python scripts/pack_features.py \\
+    --manifest /data1/AdoDas/Train/train.csv \\
+    --feature-root /data1/AdoDas \\
+    --split train \\
+    --output /data1/AdoDas/train_debug.h5 \\
+    --max-participants 100
         """
     )
     parser.add_argument('--manifest', required=True, help='Path to manifest CSV')
@@ -166,6 +183,8 @@ Examples:
     parser.add_argument('--compression', default='gzip', choices=['gzip', 'lzf', None],
                         help='Compression algorithm (default: gzip)')
     parser.add_argument('--config', help='Optional: path to config YAML to override feature selection')
+    parser.add_argument('--max-participants', type=int, default=0,
+                        help='Only pack first N participants (0=all)')
 
     args = parser.parse_args()
 
@@ -182,6 +201,7 @@ Examples:
         output_path=args.output,
         compression=args.compression,
         config_dict=config_dict,
+        max_participants=args.max_participants,
     )
 
 

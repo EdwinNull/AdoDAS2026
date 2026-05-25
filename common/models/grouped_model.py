@@ -157,6 +157,7 @@ class GroupedModel(nn.Module):
         aggregator_method: str = "mlp",
         dropout: float = 0.2,
         aux_encoder=None,
+        aux_heads=None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -166,6 +167,7 @@ class GroupedModel(nn.Module):
         )
         self.session_type_head = SessionTypeClassifier(d_in=d_shared)
         self.aux_encoder = aux_encoder
+        self.aux_heads = aux_heads
 
     def forward(
         self,
@@ -197,6 +199,11 @@ class GroupedModel(nn.Module):
         # 跨会话聚合：(B, 4, d_shared) + valid_mask → (B, d_shared)
         participant_repr = self.aggregator(session_grid, session_valid)
 
+        # LUPI: 从纯音视频表示预测辅助属性，提供额外监督信号
+        aux_logits = None
+        if self.aux_heads is not None:
+            aux_logits = self.aux_heads(participant_repr)
+
         # 如果启用辅助属性，编码并拼接到参与者表示
         if self.aux_encoder is not None and aux_attrs is not None:
             aux_encoded = self.aux_encoder(aux_attrs)  # (B, aux_dim)
@@ -209,6 +216,7 @@ class GroupedModel(nn.Module):
             "session_reprs": session_reprs,
             "participant_repr": participant_repr,
             "session_type_logits": session_type_logits,
+            "aux_logits": aux_logits,
         }
 
 

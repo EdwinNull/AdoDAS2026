@@ -112,3 +112,21 @@ session_drop_prob: 0.1            # 会话级dropout（从0.0增加到0.1）
 submission_level: participant
 decode_method: auto
 run_inference_after_train: true
+
+# LUPI: 辅助属性多任务监督 + 样本加权
+aux_lupi:
+  enabled: true
+  phase1_mtl:
+    enabled: true
+    hidden: 64
+    weights:
+      aux_family: 0.05
+      aux_only_child: 0.05
+      aux_favoritism: 0.05
+      aux_academic: 0.15
+      aux_emotional: 0.20
+  phase2_reweight:
+    enabled: false
+    method: emotional_consistency
+    weight_low: 0.7
+    weight_high: 1.2

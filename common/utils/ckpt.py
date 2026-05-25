@@ -32,11 +32,19 @@ def load_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
+    strict: bool = True,
 ) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     state = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(state["model_state_dict"])
+    missing, unexpected = model.load_state_dict(state["model_state_dict"], strict=strict)
+    if not strict and (missing or unexpected):
+        import logging
+        log = logging.getLogger(__name__)
+        if missing:
+            log.warning(f"load_checkpoint: missing keys ({len(missing)}): {missing[:5]}...")
+        if unexpected:
+            log.warning(f"load_checkpoint: unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
     if optimizer is not None:
         optimizer.load_state_dict(state["optimizer_state_dict"])
     return state

@@ -55,3 +55,26 @@ label_smoothing: 0.0
 feature_noise_std: 0.0
 session_drop_prob: 0.0
 early_stop_metric: primary
+
+# LUPI: Learning Using Privileged Information
+# 辅助属性仅在训练集可用，测试时不可用。通过多任务监督利用辅助属性提升泛化。
+aux_lupi:
+  enabled: false            # 总开关，false 时回退到 baseline 行为
+  phase1_mtl:
+    enabled: false          # Phase 1: 从 participant_repr 预测 5 个辅助属性
+    hidden: 64
+    weights:
+      aux_family: 0.05
+      aux_only_child: 0.05
+      aux_favoritism: 0.05
+      aux_academic: 0.15
+      aux_emotional: 0.20
+  phase2_reweight:
+    enabled: false          # Phase 2: 基于 aux_emotional 一致性做样本加权
+    method: emotional_consistency
+    weight_low: 0.7         # 冲突样本权重（可能错标）
+    weight_high: 1.2        # 一致样本权重
+  phase3_kd:
+    enabled: false
+  phase4_dro:
+    enabled: false

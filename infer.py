@@ -160,8 +160,12 @@ def main() -> None:
         else:
             task_head = A2OrdinalHead(task_head_input_dim).to(device)
 
-    state = load_checkpoint(checkpoint_path, grouped_model, optimizer=None)
-    task_head.load_state_dict(state["head_state_dict"])
+    state = load_checkpoint(checkpoint_path, grouped_model, optimizer=None, strict=False)
+    head_sd = state.get("participant_head_state_dict") or state.get("head_state_dict")
+    if head_sd is None:
+        raise KeyError("Checkpoint missing participant_head_state_dict (found keys: {})".format(
+            [k for k in state.keys() if k.endswith("_state_dict")]))
+    task_head.load_state_dict(head_sd)
     grouped_model.eval()
     task_head.eval()
 
@@ -171,7 +175,8 @@ def main() -> None:
 
     pids, sessions, preds = generate_submission_grouped(
         grouped_model=grouped_model,
-        task_head=task_head,
+        participant_head=task_head,
+        session_head=task_head,
         loader=loader,
         device=device,
         task=args.task,

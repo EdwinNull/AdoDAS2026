@@ -2,7 +2,7 @@
 
 ## 文件概述
 
-`heads.py` 定义了三个任务预测头：A1Head、A2OrdinalHead 和 CORALHead。这些模块将骨干网络输出的共享表示转换为具体的任务预测。
+`heads.py` 定义了任务预测头和辅助属性预测头：A1Head、A2OrdinalHead、CORALHead，以及 LUPI Phase 1 的 AuxAttributeHeads。此外还包含损失函数：ASL、Soft-F1、CORN、QWK 和 aux_attribute_loss。
 
 ## A1Head - 三分类二元预测头
 
@@ -438,6 +438,82 @@ sigmoid → [0.74, 0.52, 0.29]
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+## AuxAttributeHeads - LUPI 辅助属性预测头
+
+### 设计动机
+
+LUPI (Learning Using Privileged Information) Phase 1：训练时从 participant_repr (纯音视频表示) 预测 5 个辅助属性，迫使 backbone 编码与心理状态相关的潜变量。推理时不依赖辅助属性。
+
+与 `AuxiliaryAttributeEncoder` (输入端编码) 互补——Encoder 将辅助属性编码为输入特征，AuxAttributeHeads 反向预测辅助属性作为多任务监督信号。
+
+### 模型结构
+
+```python
+_AUX_ATTR_SPEC = {
+    "aux_family":     {"num_classes": 6, "label_offset": -1},  # raw 1-6 → label 0-5
+    "aux_only_child": {"num_classes": 2, "label_offset":  0},  # raw 0-1 → label 0-1
+    "aux_favoritism": {"num_classes": 3, "label_offset": -1},  # raw 1-3 → label 0-2
+    "aux_academic":   {"num_classes": 3, "label_offset": -1},  # raw 1-3 → label 0-2
+    "aux_emotional":  {"num_classes": 3, "label_offset": -1},  # raw 1-3 → label 0-2
+}
+
+class AuxAttributeHeads(nn.Module):
+    def __init__(self, d_in: int, hidden: int = 64, dropout: float = 0.1):
+        super().__init__()
+        self.heads = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(d_in, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, spec["num_classes"]),
+            )
+            for name, spec in _AUX_ATTR_SPEC.items()
+        })
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {name: head(x) for name, head in self.heads.items()}
+```
+
+### 损失函数
+
+```python
+def aux_attribute_loss(
+    aux_logits: dict[str, torch.Tensor],  # {name: (B, n_classes)}
+    aux_attrs: torch.Tensor,              # (B, 5) 原始值, -1=缺失
+    weights: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """加权 CrossEntropy, 自动 skip -1 缺失值"""
+    total = 0.0
+    acc_dict = {}
+    for i, name in enumerate(_AUX_ATTR_NAMES):
+        valid = aux_attrs[:, i] >= 0     # 过滤缺失值
+        if valid.sum() == 0: continue
+        labels = (aux_attrs[:, i] + offset).clamp(min=0)  # 重新映射到 0-indexed
+        ce = F.cross_entropy(aux_logits[name][valid], labels[valid])
+        total += weights[name] * ce
+        acc_dict[name] = accuracy(logits[valid], labels[valid])
+    return total, acc_dict
+```
+
+### 数据流位置
+
+```
+participant_repr (B, d_shared)
+    ├── → AuxAttributeHeads → aux_logits → aux_attribute_loss (训练时监督信号)
+    └── → concat(aux_encoded) → 任务头 → 主任务预测
+```
+
+关键设计：AuxAttributeHeads 作用于 **aux_encoder 拼接之前**的 participant_repr（纯音视频表示），确保 LUPI 范式正确——backbone 在无辅助属性时也能学到相关表示。
+
+### 权重推荐
+
+基于临床先验：
+- `aux_emotional`: 0.20 (与 DASS 最相关)
+- `aux_academic`: 0.15 (抑郁前驱症状)
+- `aux_family` / `aux_only_child` / `aux_favoritism`: 0.05 (弱相关)
+
+总辅助损失应为主任务的 1/3 ~ 1/2。若主指标下降，整体下调权重 50%。
 
 ## 使用示例
 

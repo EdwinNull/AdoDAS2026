@@ -62,3 +62,25 @@ early_stop_metric: val_loss
 use_corn_loss: 1
 use_qwk_aux: 1
 qwk_weight: 0.3
+
+# LUPI: Learning Using Privileged Information
+aux_lupi:
+  enabled: false
+  phase1_mtl:
+    enabled: false
+    hidden: 64
+    weights:
+      aux_family: 0.05
+      aux_only_child: 0.05
+      aux_favoritism: 0.05
+      aux_academic: 0.15
+      aux_emotional: 0.20
+  phase2_reweight:
+    enabled: false
+    method: emotional_consistency
+    weight_low: 0.7
+    weight_high: 1.2
+  phase3_kd:
+    enabled: false
+  phase4_dro:
+    enabled: false

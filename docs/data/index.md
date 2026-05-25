@@ -566,40 +566,96 @@ def preload(self, desc: str = None) -> float:
 ### 配置示例
 
 ```yaml
-# tasks/a1/default.yaml 中的数据配置部分
-feature_root: "/path/to/features"
-manifest_dir: "/path/to/manifests"
+# tasks/a2/default.yaml 中的数据配置部分
+feature_root: "/data1/AdoDas"
+manifest_dir: "/data1/AdoDas"
 
-# 特征选择
-audio_features:
-  - mel_mfcc
-  - vad
-  - ssl_embed
-  - egemaps
+feature_selection:
+  audio_features:
+    - mel_mfcc
+    - vad
+    - ssl_embed
+    - egemaps
+  video_features:
+    - headpose_geom
+    - face_behavior
+    - qc_stats
+    - vad_agg
+    - body_pose
+    - global_motion
+    - vision_ssl_embed
+  audio_ssl_model_tag: "chinese-hubert-large"
+  video_ssl_model_tag: "vit-mae-base"
 
-video_features:
-  - headpose_geom
-  - face_behavior
-  - qc_stats
-  - vision_ssl_embed
-
-audio_ssl_model_tag: "chinese-hubert-base"
-video_ssl_model_tag: "dinov2-base"
-
-# 掩码策略
 mask_policy: "and_core"
-core_audio: ["mel_mfcc", "vad"]
-core_video: ["face_behavior", "headpose_geom"]
+core_audio: ["mel_mfcc", "ssl_embed"]
+core_video: ["vision_ssl_embed", "qc_stats"]
 
-# 数据增强
 session_drop_prob: 0.1
 feature_noise_std: 0.01
 label_smoothing: 0.05
-
-# 加载设置
 preload: true
 num_workers: 8
 ```
+
+### 数据目录结构与路径解析
+
+```
+/data1/AdoDas/
+├── Train/train.csv              # 训练集 manifest (16801 行)
+├── Train/train/train/           # 训练集特征 (SCH_xxx/CLS_xxx/P_xxx/...)
+├── Val/val.csv                  # 验证集 manifest (2401 行)
+├── Val/val/val/                 # 验证集特征
+├── Test/test/test_hidden/       # 测试集特征 (无 manifest, 无标签)
+└── output/                      # 训练输出
+```
+
+逻辑 split 名 → 实际子路径映射 (`SPLIT_DATA_PATH` in `common/data/dataset.py`):
+| 逻辑 split | 子路径 | 说明 |
+|-----------|--------|------|
+| `train` | `Train/train/train` | 训练集特征目录 |
+| `val` | `Val/val/val` | 验证集特征目录 |
+| `test_hidden` | `Test/test/test_hidden` | 测试集特征目录 |
+
+数据集加载流程: `feature_root / SPLIT_DATA_PATH[split] / school / class / pid / modality / feature / session / sequence.npz`
+
+特征维度（实测）:
+| 特征 | 维度 | 类型 |
+|------|------|------|
+| mel_mfcc | 93 | 音频时序 |
+| vad | 1 | 音频时序 |
+| ssl_embed (chinese-hubert-large) | 1024 | 音频时序 |
+| egemaps | 88 | 音频池化 |
+| headpose_geom | 5 | 视频时序 |
+| face_behavior | 5 | 视频时序 |
+| qc_stats | 4 | 视频时序 |
+| vad_agg | 4 | 视频时序 |
+| body_pose | 27 | 视频时序 |
+| global_motion | 4 | 视频时序 |
+| vision_ssl_embed (vit-mae-base) | 768 | 视频时序 |
+
+### HDF5 加速
+
+将分散的 npz 文件打包为单文件 HDF5，减少小文件 I/O 和 NFS 元数据开销。
+
+```bash
+# 全量打包
+python scripts/pack_features.py \
+  --manifest /data1/AdoDas/Train/train.csv \
+  --feature-root /data1/AdoDas \
+  --split train \
+  --output /data1/AdoDas/train_packed.h5
+
+# Debug 子集
+python scripts/pack_features.py \
+  --manifest /data1/AdoDas/Train/train.csv \
+  --feature-root /data1/AdoDas \
+  --split train \
+  --output /data1/AdoDas/train_debug.h5 \
+  --max-participants 100
+```
+
+打包后在 YAML 中设置 `use_hdf5: true`。数据集自动 switch 到 `HDF5GroupedDataset`，加载速度提升 3-5x。
 
 ---
 

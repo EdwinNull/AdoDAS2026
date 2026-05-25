@@ -235,15 +235,19 @@ type_loss = F.cross_entropy(
 class GroupedModel(nn.Module):
     def __init__(
         self,
-        backbone: MTCNBackbone,         # 多模态TCN骨干
-        d_shared: int,                  # 共享维度
-        aggregator_method: str = "mlp",  # 聚合方法
+        backbone: MTCNBackbone,
+        d_shared: int,
+        aggregator_method: str = "mlp",
         dropout: float = 0.2,
+        aux_encoder=None,          # AuxiliaryAttributeEncoder (输入端)
+        aux_heads=None,            # AuxAttributeHeads (LUPI Phase 1 输出端)
     ):
         super().__init__()
         self.backbone = backbone
         self.aggregator = ParticipantAggregator(d_shared, d_shared, aggregator_method, dropout)
         self.session_type_head = SessionTypeClassifier(d_in=d_shared, n_classes=4)
+        self.aux_encoder = aux_encoder
+        self.aux_heads = aux_heads
 ```
 
 ### 前向传播流程
@@ -274,14 +278,23 @@ def forward(
 3. 参与者聚合:
    participant_repr = self.aggregator(session_grid, session_valid)  → (B, d_shared)
 
+   3a. LUPI Phase 1: 辅助属性预测 (aux_encoder 拼接之前)
+       if self.aux_heads is not None:
+           aux_logits = self.aux_heads(participant_repr)  → {name: (B, n_classes)}
+
+   3b. 辅助属性编码拼接 (输入端, 可选)
+       if self.aux_encoder is not None:
+           participant_repr = cat([participant_repr, aux_encoded])  → (B, d_shared + aux_dim)
+
 4. 会话类型分类:
    session_type_logits = self.session_type_head(session_reprs)  → (N, 4)
 
 5. 返回:
    {
        "session_reprs": session_reprs,       # (N, d_shared)
-       "participant_repr": participant_repr, # (B, d_shared)
+       "participant_repr": participant_repr, # (B, d_shared [+ aux_dim])
        "session_type_logits": session_type_logits,  # (N, 4)
+       "aux_logits": aux_logits,             # LUPI: Dict or None
    }
 ```
 

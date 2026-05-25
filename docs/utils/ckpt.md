@@ -50,13 +50,17 @@ def load_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
+    strict: bool = True,
 ) -> dict[str, Any]:
     """
     加载训练检查点
-    
+
     参数:
         path: 检查点路径
         model: 要加载参数的模型
+        optimizer: 优化器 (可选)
+        strict: 是否严格匹配 state_dict keys (默认 True)
+                推理时使用 strict=False 以兼容 LUPI 扩展键
         optimizer: 优化器（可选，加载状态）
     
     返回:
