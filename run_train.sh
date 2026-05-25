@@ -131,7 +131,7 @@ esac
 
 # ---- 验证关键路径 ----
 DATA_ROOT="${ADODAS_DATA_ROOT:-/data1/AdoDas}"
-OUTPUT_ROOT="${ADODAS_OUTPUT_ROOT:-/data1/AdoDas/output}"
+OUTPUT_ROOT="${ADODAS_OUTPUT_ROOT:-./output}"
 
 if [[ ! -d "$DATA_ROOT" ]]; then
     echo "错误: 数据根目录不存在: $DATA_ROOT"

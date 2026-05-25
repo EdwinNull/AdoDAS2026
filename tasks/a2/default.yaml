@@ -1,6 +1,6 @@
 feature_root: /data1/AdoDas
 manifest_dir: /data1/AdoDas
-output_dir: /data1/AdoDas/output
+output_dir: ./output
 
 feature_selection:
   audio_features:

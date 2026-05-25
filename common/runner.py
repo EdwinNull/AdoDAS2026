@@ -1160,7 +1160,7 @@ def main() -> None:
     seed_everything(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    output_root = Path(cfg.get("output_dir", "/data1/AdoDas/output"))
+    output_root = Path(cfg.get("output_dir", "./output"))
     manifest_dir = Path(cfg.get("manifest_dir", "/data1/AdoDas"))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
