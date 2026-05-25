@@ -1190,6 +1190,7 @@ def main() -> None:
 
     # 选择使用HDF5或原始数据集
     use_hdf5 = bool(cfg.get("use_hdf5", False))
+    max_pts = cfg.get("max_participants", 0) or 0
 
     if use_hdf5:
         log.info("Using HDF5 packed datasets")
@@ -1226,7 +1227,6 @@ def main() -> None:
         val_ds = GroupedParticipantDataset(manifest_dir / "Val" / "val.csv", feat_cfg, split="val",
                                           max_participants=max_pts)
 
-    max_pts = cfg.get("max_participants", 0) or 0
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
     log.info(f"Train: {len(train_ds)} participants, Val: {len(val_ds)} participants")
