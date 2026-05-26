@@ -57,30 +57,18 @@ use_qwk_aux: 1                    # 启用可微 QWK 辅助损失（直接优化
 qwk_weight: 0.3                   # QWK 损失权重
 
 # ============================================================
-# 不确定性加权多任务学习（Auxiliary Tasks）- 新增功能
+# 不确定性加权多任务学习（Auxiliary Tasks）
 # ============================================================
-# 注意：这与上面的"辅助属性"不同！
-# 辅助属性 = 静态背景信息（已有数据）
-# 辅助任务 = 额外预测任务（需要额外标签）
-#
-# 辅助任务包括：
-# - 情绪维度预测：valence（愉悦度）和 arousal（激活度）
-# - 情感分类：4类基础情绪（快乐/悲伤/愤怒/中性）
-# - AU预测：12个关键面部动作单元
-#
-# 方案B（完整MTL）：启用辅助任务和不确定性加权
-use_uncertainty_weighting: true   # 启用不确定性加权（自动平衡任务权重）
-enable_auxiliary_tasks: true      # 启用辅助任务
-enable_emotion_dims: true         # 情绪维度预测（从DASS-21推导）
-enable_emotion_cls: true          # 情感分类（从DASS-21推导）
-enable_au_pred: false             # 面部AU预测（暂不启用，需要OpenFace数据）
+# emotion_dims (valence/arousal) 由 DASS-21 推导，保留为弱正则化项 (weight ≤ 0.05)
+# emotion_cls 和 AU 预测已删除：前者与主标签同源无新增信号，后者为占位实现
+use_uncertainty_weighting: true
+enable_auxiliary_tasks: true
+enable_emotion_dims: true
 
 # 固定任务权重（仅在 use_uncertainty_weighting=false 时生效）
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
-emotion_dims_weight: 0.2          # 情绪维度损失权重
-emotion_cls_weight: 0.15          # 情感分类损失权重
-au_pred_weight: 0.1               # AU预测损失权重
+emotion_dims_weight: 0.05
 
 # ============================================================
 # 训练超参数

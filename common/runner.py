@@ -589,9 +589,7 @@ def train_one_epoch_mtl(
     # MTL 固定权重（仅在不使用不确定性加权时生效）
     session_loss_weight: float = 0.5,
     session_type_loss_weight: float = 0.15,
-    emotion_dims_weight: float = 0.2,
-    emotion_cls_weight: float = 0.15,
-    au_pred_weight: float = 0.1,
+    emotion_dims_weight: float = 0.05,
     # LUPI
     aux_lupi_weights: dict[str, float] | None = None,
     phase2_reweight: bool = False,
@@ -679,8 +677,6 @@ def train_one_epoch_mtl(
                 session_loss_weight=session_loss_weight,
                 session_type_loss_weight=session_type_loss_weight,
                 emotion_dims_weight=emotion_dims_weight,
-                emotion_cls_weight=emotion_cls_weight,
-                au_pred_weight=au_pred_weight,
             )
 
             # LUPI Phase 1: 辅助属性预测损失
@@ -1354,14 +1350,10 @@ def main() -> None:
             use_uncertainty_weighting=use_uncertainty_weighting,
             enable_auxiliary_tasks=True,
             enable_emotion_dims=bool(cfg.get("enable_emotion_dims", True)),
-            enable_emotion_cls=bool(cfg.get("enable_emotion_cls", True)),
-            enable_au_pred=bool(cfg.get("enable_au_pred", False)),
         ).to(device)
 
         log.info(f"Uncertainty weighting: {use_uncertainty_weighting}")
-        log.info(f"Emotion dims prediction: {cfg.get('enable_emotion_dims', True)}")
-        log.info(f"Emotion classification: {cfg.get('enable_emotion_cls', True)}")
-        log.info(f"AU prediction: {cfg.get('enable_au_pred', False)}")
+        log.info(f"Emotion dims regularization: {cfg.get('enable_emotion_dims', True)}")
 
         # 重新计算参数数量
         n_params_mtl = sum(p.numel() for p in optimized_model.parameters())
@@ -1470,9 +1462,7 @@ def main() -> None:
                 qwk_weight=cfg.get("qwk_weight", 0.3),
                 session_loss_weight=session_loss_weight,
                 session_type_loss_weight=session_type_loss_weight,
-                emotion_dims_weight=cfg.get("emotion_dims_weight", 0.2),
-                emotion_cls_weight=cfg.get("emotion_cls_weight", 0.15),
-                au_pred_weight=cfg.get("au_pred_weight", 0.1),
+                emotion_dims_weight=cfg.get("emotion_dims_weight", 0.05),
                 aux_lupi_weights=aux_lupi_weights,
                 phase2_reweight=phase2_enabled,
                 phase2_w_low=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_low", 0.7) if phase2_enabled else 0.7,
@@ -1715,7 +1705,12 @@ def main() -> None:
             manifest_path = manifest_dir / _MANIFEST_SPLIT_DIR[split_name] / f"{split_name}.csv"
             if not manifest_path.exists():
                 continue
-            ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=split_name)
+            use_hdf5_for_submit = bool(cfg.get("use_hdf5", False))
+            hdf5_path = Path(cfg["feature_root"]) / f"{split_name}_packed.h5"
+            if use_hdf5_for_submit and hdf5_path.exists():
+                ds = HDF5GroupedDataset(str(hdf5_path), session_drop_prob=0.0)
+            else:
+                ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=split_name)
             loader = DataLoader(
                 ds, batch_size=batch_size, shuffle=False,
                 num_workers=num_workers, collate_fn=grouped_collate_fn,

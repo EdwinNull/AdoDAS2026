@@ -42,9 +42,9 @@ from common.runner import _decode_a2_logits, _normalize_decode_method
 
 log = logging.getLogger("predict_a2")
 
-BEST_RUN_DIR = Path("/data1/AdoDas/output/a2/runs/best_run")
+DEFAULT_RUNS_DIR = Path("./output/runs")
 DEFAULT_TEST_ROOT = Path("/data1/AdoDas/Test/test/test_hidden")
-DEFAULT_OUTPUT_CSV = Path("/data1/AdoDas/output/result_pred.csv")
+DEFAULT_OUTPUT_CSV = Path("./result_pred.csv")
 TEMPLATE_CSV = Path("/data1/AdoDas/output/result.csv")
 
 
@@ -210,17 +210,19 @@ def build_model_from_config(cfg: dict, model_sd: dict[str, torch.Tensor]
     audio_pooled_group_dims: dict[str, int] = {}
     video_group_dims: dict[str, int] = {}
     for k, v in model_sd.items():
+        # sequence adapters: backbone.audio_adapters.<name>.norm.weight
         m = re.match(r"backbone\.(audio|video)_adapters\.([^.]+)\.norm\.weight$", k)
-        if not m:
-            continue
-        modality, name = m.group(1), m.group(2)
-        if modality == "audio":
-            if name in feat_cfg.audio_pooled_features:
-                audio_pooled_group_dims[name] = int(v.shape[0])
-            else:
+        if m:
+            modality, name = m.group(1), m.group(2)
+            if modality == "audio":
                 audio_group_dims[name] = int(v.shape[0])
-        else:
-            video_group_dims[name] = int(v.shape[0])
+            else:
+                video_group_dims[name] = int(v.shape[0])
+            continue
+        # pooled adapters: backbone.audio_pooled_adapters.<name>.0.weight (LayerNorm)
+        m = re.match(r"backbone\.audio_pooled_adapters\.([^.]+)\.0\.weight$", k)
+        if m:
+            audio_pooled_group_dims[m.group(1)] = int(v.shape[0])
 
     log.info(f"Inferred audio seq dims: {audio_group_dims}")
     log.info(f"Inferred audio pooled dims: {audio_pooled_group_dims}")
@@ -271,7 +273,67 @@ def build_model_from_config(cfg: dict, model_sd: dict[str, torch.Tensor]
         participant_head = A2OrdinalHead(head_in)
         log.info(f"A2Ordinal head built: in={head_in}, items=21, thresholds=3")
 
-    return grouped_model, participant_head, feat_cfg
+    return grouped_model, participant_head, feat_cfg, audio_group_dims, video_group_dims
+
+
+# ---------------------------------------------------------------------------
+# SSL model tag auto-detection
+# ---------------------------------------------------------------------------
+
+def _match_ssl_tag(
+    test_root: Path,
+    feat_name: str,
+    modality: str,
+    expected_dim: int,
+    preferred_tag: str,
+) -> str:
+    """Find an SSL model tag on disk whose feature dimension matches *expected_dim*.
+
+    Scans the first available participant directory for the given feature name
+    and tries each discovered model tag.  Falls back to *preferred_tag* if no
+    match is found.
+    """
+    # Walk into the first participant we can find
+    for sch in sorted(test_root.iterdir()):
+        if not sch.is_dir():
+            continue
+        for cls in sorted(sch.iterdir()):
+            if not cls.is_dir():
+                continue
+            for pid in sorted(cls.iterdir()):
+                if not pid.is_dir():
+                    continue
+                feat_dir = pid / modality / feat_name
+                if not feat_dir.is_dir():
+                    continue
+                # Try every model tag sub-directory
+                for tag_dir in sorted(feat_dir.iterdir()):
+                    if not tag_dir.is_dir():
+                        continue
+                    # Load first session sequence to get dim
+                    sessions = sorted(
+                        s for s in tag_dir.iterdir()
+                        if s.is_dir() and s.name in SESSIONS
+                    )
+                    if not sessions:
+                        continue
+                    try:
+                        arr = np.load(str(sessions[0] / "sequence.npz"))
+                        probe_dim = arr["features"].shape[1]
+                    except Exception:
+                        continue
+                    if probe_dim == expected_dim:
+                        log.info(
+                            "Auto-matched %s SSL: tag=%s dim=%d",
+                            modality, tag_dir.name, probe_dim,
+                        )
+                        return tag_dir.name
+                # If we reached here, no match in this participant — fall through
+    log.warning(
+        "Could not find %s SSL tag with dim=%d, using preferred %r",
+        modality, expected_dim, preferred_tag,
+    )
+    return preferred_tag
 
 
 # ---------------------------------------------------------------------------
@@ -369,10 +431,25 @@ def run_inference(
 # Main
 # ---------------------------------------------------------------------------
 
+def _find_latest_run(runs_dir: Path) -> Path | None:
+    """Return the newest run directory under *runs_dir* that has checkpoints/best.pt."""
+    if not runs_dir.is_dir():
+        return None
+    dirs = sorted(
+        [d for d in runs_dir.iterdir() if d.is_dir()],
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+    for d in dirs:
+        if (d / "checkpoints" / "best.pt").exists():
+            return d
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="A2 test-set prediction")
-    p.add_argument("--run-dir", type=Path, default=BEST_RUN_DIR,
-                   help="Training run directory (must contain checkpoints/best.pt + run_meta.json)")
+    p.add_argument("--run-dir", type=Path, default=None,
+                   help="Training run directory (auto-detected from ./output/runs/ if omitted)")
     p.add_argument("--test-root", type=Path, default=DEFAULT_TEST_ROOT)
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_CSV)
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -402,16 +479,25 @@ def main() -> int:
     )
     args = parse_args()
 
+    # Auto-discover latest run if --run-dir not specified
+    run_dir = args.run_dir
+    if run_dir is None:
+        run_dir = _find_latest_run(DEFAULT_RUNS_DIR)
+        if run_dir is None:
+            log.error("No run directory specified and no runs found under %s", DEFAULT_RUNS_DIR)
+            return 1
+        log.info("Auto-detected latest run: %s", run_dir)
+
     log.info("=" * 80)
     log.info("A2 prediction (best QWK checkpoint)")
     log.info("=" * 80)
-    log.info(f"Run dir   : {args.run_dir}")
+    log.info(f"Run dir   : {run_dir}")
     log.info(f"Test root : {args.test_root}")
     log.info(f"Output csv: {args.output}")
 
-    meta_path = args.run_dir / "run_meta.json"
-    ckpt_path = args.run_dir / "checkpoints" / "best.pt"
-    cfg_path = args.run_dir / "config_used.yaml"
+    meta_path = run_dir / "run_meta.json"
+    ckpt_path = run_dir / "checkpoints" / "best.pt"
+    cfg_path = run_dir / "config_used.yaml"
     for p in (meta_path, ckpt_path):
         if not p.exists():
             log.error(f"Missing required file: {p}")
@@ -434,15 +520,31 @@ def main() -> int:
 
     log.info("Loading checkpoint ...")
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    model_sd = ckpt["model_state_dict"]
-    head_sd = ckpt["participant_head_state_dict"]
-    log.info(f"Checkpoint epoch={ckpt.get('epoch')} best_metric={ckpt.get('best_metric'):.4f}")
-    if ckpt.get("enable_mtl"):
-        log.error("This checkpoint was saved as MTL — run_predict_a2.py only "
-                  "supports the standard (non-MTL) GroupedModel.")
+    full_sd = ckpt["model_state_dict"]
+
+    # Extract grouped_model.* and participant_head.* from the flat state dict.
+    model_sd: dict[str, torch.Tensor] = {}
+    head_sd: dict[str, torch.Tensor] = {}
+    for k, v in full_sd.items():
+        if k.startswith("grouped_model."):
+            model_sd[k[len("grouped_model."):]] = v
+        elif k.startswith("participant_head."):
+            head_sd[k[len("participant_head."):]] = v
+
+    if not model_sd:
+        log.error("No grouped_model.* keys found in checkpoint")
+        return 2
+    if not head_sd:
+        log.error("No participant_head.* keys found in checkpoint")
         return 2
 
-    grouped_model, participant_head, feat_cfg = build_model_from_config(cfg, model_sd)
+    log.info(f"Checkpoint epoch={ckpt.get('epoch')} best_metric={ckpt.get('best_metric'):.4f}")
+    log.info(f"Extracted {len(model_sd)} grouped_model keys + {len(head_sd)} participant_head keys")
+    if ckpt.get("enable_mtl"):
+        log.info("MTL checkpoint detected — non-grouped_model keys (aux_task_head, "
+                 "session_head, etc.) are skipped at load time")
+
+    grouped_model, participant_head, feat_cfg, audio_group_dims, video_group_dims = build_model_from_config(cfg, model_sd)
 
     missing, unexpected = grouped_model.load_state_dict(model_sd, strict=False)
     if missing:
@@ -456,6 +558,27 @@ def main() -> int:
     n_params = sum(p.numel() for p in grouped_model.parameters()) \
         + sum(p.numel() for p in participant_head.parameters())
     log.info(f"Model loaded ({n_params/1e6:.2f}M params)")
+
+    # Auto-match SSL model tags to the dimensions the checkpoint expects.
+    # This prevents 768-vs-1024 dimension mismatches when the HDF5-packed
+    # features used a different SSL model than the one written in config_used.yaml.
+    expected_audio_ssl_dim = audio_group_dims.get("ssl_embed")
+    expected_video_ssl_dim = video_group_dims.get("vision_ssl_embed")
+    for feat_name, tag_attr, expected_dim in [
+        ("ssl_embed", "audio_ssl_model_tag", expected_audio_ssl_dim),
+        ("vision_ssl_embed", "video_ssl_model_tag", expected_video_ssl_dim),
+    ]:
+        if expected_dim is None:
+            continue
+        preferred = cfg.get(tag_attr, "")
+        matched = _match_ssl_tag(
+            args.test_root, feat_name,
+            "audio" if "audio" in tag_attr else "video",
+            expected_dim, str(preferred),
+        )
+        if matched != preferred:
+            setattr(feat_cfg, tag_attr, matched)
+            log.info("Overriding %s: %s -> %s", tag_attr, preferred, matched)
 
     log.info("Discovering test manifest ...")
     manifest, school_to_root = discover_manifest(args.test_root)
@@ -477,7 +600,7 @@ def main() -> int:
         pin_memory=(device.type == "cuda"),
     )
 
-    decode_method, offsets = load_calibration(args.run_dir)
+    decode_method, offsets = load_calibration(run_dir)
 
     log.info(f"Running inference: {len(dataset)} participants, "
              f"batch_size={args.batch_size}, workers={args.num_workers} ...")

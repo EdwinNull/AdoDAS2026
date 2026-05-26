@@ -51,8 +51,6 @@ def test_auxiliary_labels_loading():
             print(f"✓ 辅助任务标签存在")
             print(f"  - emotion_dims shape: {aux_targets['emotion_dims'].shape}")
             print(f"  - emotion_dims values: {aux_targets['emotion_dims']}")
-            print(f"  - emotion_cls: {aux_targets['emotion_cls'].item()}")
-            print(f"  - au_labels shape: {aux_targets['au_labels'].shape}")
         else:
             print("✗ 辅助任务标签不存在")
             return False
@@ -93,8 +91,6 @@ def test_batch_collation():
             aux_targets = batch["auxiliary_targets"]
             print(f"✓ 辅助任务标签批处理成功")
             print(f"  - emotion_dims shape: {aux_targets['emotion_dims'].shape}")
-            print(f"  - emotion_cls shape: {aux_targets['emotion_cls'].shape}")
-            print(f"  - au_labels shape: {aux_targets['au_labels'].shape}")
         else:
             print("✗ 辅助任务标签未批处理")
             return False
@@ -170,8 +166,6 @@ def test_model_forward():
             use_uncertainty_weighting=True,
             enable_auxiliary_tasks=True,
             enable_emotion_dims=True,
-            enable_emotion_cls=True,
-            enable_au_pred=False,
         )
 
         print(f"✓ 模型创建成功")
@@ -192,7 +186,6 @@ def test_model_forward():
 
         if "emotion_dims" in outputs:
             print(f"  - emotion_dims shape: {outputs['emotion_dims'].shape}")
-            print(f"  - emotion_cls shape: {outputs['emotion_cls'].shape}")
 
         print()
         return True
@@ -262,8 +255,6 @@ def test_loss_computation():
             use_uncertainty_weighting=True,
             enable_auxiliary_tasks=True,
             enable_emotion_dims=True,
-            enable_emotion_cls=True,
-            enable_au_pred=False,
         )
 
         # 前向传播

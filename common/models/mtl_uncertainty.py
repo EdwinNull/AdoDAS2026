@@ -69,77 +69,25 @@ class UncertaintyWeightedLoss(nn.Module):
 
 
 class MultiTaskHead(nn.Module):
-    """
-    多任务预测头集合
+    """多任务预测头 — 仅保留 emotion_dims 作为弱正则化项"""
 
-    包含：
-        - 主任务头（A1 或 A2）
-        - 会话级任务头
-        - 辅助任务头（情绪维度、情感分类、AU预测）
-    """
-    def __init__(
-        self,
-        d_in: int,
-        task_type: str,  # "a1" or "a2"
-        enable_emotion_dims: bool = True,
-        enable_emotion_cls: bool = True,
-        enable_au_pred: bool = True,
-    ):
+    def __init__(self, d_in: int, task_type: str, enable_emotion_dims: bool = True):
         super().__init__()
         self.task_type = task_type
         self.enable_emotion_dims = enable_emotion_dims
-        self.enable_emotion_cls = enable_emotion_cls
-        self.enable_au_pred = enable_au_pred
 
-        # 辅助任务头
         if enable_emotion_dims:
-            # 情绪维度预测：valence（愉悦度）和 arousal（激活度）
-            # 输出范围 [-1, 1]，使用 tanh 激活
             self.emotion_dim_head = nn.Sequential(
                 nn.Linear(d_in, 64),
                 nn.GELU(),
                 nn.Dropout(0.2),
-                nn.Linear(64, 2),  # [valence, arousal]
-            )
-
-        if enable_emotion_cls:
-            # 基础情感分类：4类（快乐、悲伤、愤怒、中性）
-            self.emotion_cls_head = nn.Sequential(
-                nn.Linear(d_in, 64),
-                nn.GELU(),
-                nn.Dropout(0.2),
-                nn.Linear(64, 4),
-            )
-
-        if enable_au_pred:
-            # 面部动作单元（AU）预测：12个关键AU的多标签分类
-            # AU: 1,2,4,5,6,7,9,12,15,17,20,25
-            self.au_head = nn.Sequential(
-                nn.Linear(d_in, 64),
-                nn.GELU(),
-                nn.Dropout(0.2),
-                nn.Linear(64, 12),
+                nn.Linear(64, 2),
             )
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """
-        参数:
-            x: (B, d_in) 输入特征
-
-        返回:
-            outputs: 各辅助任务的输出字典
-        """
         outputs = {}
-
         if self.enable_emotion_dims:
-            outputs["emotion_dims"] = self.emotion_dim_head(x)  # (B, 2)
-
-        if self.enable_emotion_cls:
-            outputs["emotion_cls"] = self.emotion_cls_head(x)  # (B, 4)
-
-        if self.enable_au_pred:
-            outputs["au_logits"] = self.au_head(x)  # (B, 12)
-
+            outputs["emotion_dims"] = self.emotion_dim_head(x)
         return outputs
 
 
@@ -147,58 +95,21 @@ def compute_auxiliary_losses(
     aux_outputs: dict[str, torch.Tensor],
     aux_targets: dict[str, torch.Tensor] | None,
 ) -> dict[str, torch.Tensor]:
-    """
-    计算辅助任务损失
-
-    参数:
-        aux_outputs: 辅助任务预测输出
-        aux_targets: 辅助任务真实标签（可能为 None，表示该 batch 无标签）
-
-    返回:
-        losses: 各辅助任务的损失字典
-    """
+    """计算辅助任务损失 — 仅 emotion_dims (弱正则化 MSE)"""
     losses = {}
 
     if aux_targets is None:
-        # 无辅助标签时，返回零损失
         for key in aux_outputs:
             losses[key] = aux_outputs[key].new_zeros(())
         return losses
 
-    # 情绪维度损失（MSE）
     if "emotion_dims" in aux_outputs and "emotion_dims" in aux_targets:
-        pred = torch.tanh(aux_outputs["emotion_dims"])  # 限制到 [-1, 1]
+        pred = torch.tanh(aux_outputs["emotion_dims"])
         target = aux_targets["emotion_dims"]
-        mask = ~torch.isnan(target).any(dim=-1)  # 过滤无效标签
-        if mask.any():
-            losses["emotion_dims"] = nn.functional.mse_loss(
-                pred[mask], target[mask]
-            )
-        else:
-            losses["emotion_dims"] = pred.new_zeros(())
-
-    # 情感分类损失（CE）
-    if "emotion_cls" in aux_outputs and "emotion_cls" in aux_targets:
-        logits = aux_outputs["emotion_cls"]
-        target = aux_targets["emotion_cls"].long()
-        mask = target >= 0  # -1 表示无标签
-        if mask.any():
-            losses["emotion_cls"] = nn.functional.cross_entropy(
-                logits[mask], target[mask]
-            )
-        else:
-            losses["emotion_cls"] = logits.new_zeros(())
-
-    # AU 预测损失（BCE）
-    if "au_logits" in aux_outputs and "au_labels" in aux_targets:
-        logits = aux_outputs["au_logits"]
-        target = aux_targets["au_labels"].float()
         mask = ~torch.isnan(target).any(dim=-1)
         if mask.any():
-            losses["au_pred"] = nn.functional.binary_cross_entropy_with_logits(
-                logits[mask], target[mask]
-            )
+            losses["emotion_dims"] = nn.functional.mse_loss(pred[mask], target[mask])
         else:
-            losses["au_pred"] = logits.new_zeros(())
+            losses["emotion_dims"] = pred.new_zeros(())
 
     return losses

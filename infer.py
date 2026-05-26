@@ -13,6 +13,7 @@ import yaml
 
 from common.data.dataset import FeatureConfig
 from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
+from common.data.hdf5_dataset import HDF5GroupedDataset
 from common.models.grouped_model import CORALHead, GroupedModel
 from common.models.heads import A1Head, A2OrdinalHead
 from common.models.mtcn_backbone import BackboneConfig, MTCNBackbone
@@ -102,7 +103,12 @@ def main() -> None:
         core_video=cfg.get("core_video", defaults.core_video),
     )
 
-    ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=args.split)
+    use_hdf5 = bool(cfg.get("use_hdf5", False))
+    hdf5_path = Path(cfg.get("feature_root", "/data1/AdoDas")) / f"{args.split}_packed.h5"
+    if use_hdf5 and hdf5_path.exists():
+        ds = HDF5GroupedDataset(str(hdf5_path), session_drop_prob=0.0)
+    else:
+        ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=args.split)
     preload = bool(cfg.get("preload", True))
     num_workers = int(cfg.get("num_workers", 8))
     if preload:

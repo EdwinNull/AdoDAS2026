@@ -33,7 +33,7 @@ def test_uncertainty_weighting():
     print("测试 1: 不确定性加权损失")
     print("="*60)
 
-    n_tasks = 5
+    n_tasks = 4
     uw_loss = UncertaintyWeightedLoss(n_tasks=n_tasks)
 
     # 模拟各任务损失
@@ -42,7 +42,6 @@ def test_uncertainty_weighting():
         torch.tensor(0.3),  # 会话任务
         torch.tensor(0.8),  # 会话类型
         torch.tensor(0.2),  # 情绪维度
-        torch.tensor(0.4),  # 情感分类
     ]
 
     total_loss, weights = uw_loss(losses)
@@ -73,8 +72,6 @@ def test_auxiliary_task_heads():
         d_in=d_in,
         task_type="a1",
         enable_emotion_dims=True,
-        enable_emotion_cls=True,
-        enable_au_pred=True,
     )
 
     x = torch.randn(batch_size, d_in)
@@ -88,8 +85,6 @@ def test_auxiliary_task_heads():
     # 测试损失计算
     aux_targets = {
         "emotion_dims": torch.randn(batch_size, 2),
-        "emotion_cls": torch.randint(0, 4, (batch_size,)),
-        "au_labels": torch.randint(0, 2, (batch_size, 12)).float(),
     }
 
     losses = compute_auxiliary_losses(outputs, aux_targets)
@@ -215,8 +210,6 @@ def test_integrated_forward():
         "use_uncertainty_weighting": True,
         "enable_auxiliary_tasks": True,
         "enable_emotion_dims": True,
-        "enable_emotion_cls": True,
-        "enable_au_pred": True,
     }
 
     optimized_model = create_optimized_model(

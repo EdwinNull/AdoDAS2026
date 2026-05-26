@@ -24,19 +24,7 @@ from common.models.mtl_uncertainty import (
 
 
 class OptimizedGroupedModel(nn.Module):
-    """
-    优化版分组模型：集成不确定性加权MTL和辅助任务
-
-    架构：
-        GroupedModel (骨干 + 聚合)
-            ↓
-        participant_repr (B, d_shared + aux_dim)
-            ↓
-        ├── 主任务头（A1/A2）
-        ├── 会话级任务头
-        ├── 会话类型分类头
-        └── 辅助任务头（情绪维度、情感分类、AU预测）
-    """
+    """优化版分组模型：集成不确定性加权MTL和辅助任务 (仅 emotion_dims 弱正则化)"""
     def __init__(
         self,
         grouped_model: GroupedModel,
@@ -47,8 +35,6 @@ class OptimizedGroupedModel(nn.Module):
         use_uncertainty_weighting: bool = True,
         enable_auxiliary_tasks: bool = True,
         enable_emotion_dims: bool = True,
-        enable_emotion_cls: bool = True,
-        enable_au_pred: bool = True,
     ):
         super().__init__()
         self.grouped_model = grouped_model
@@ -57,24 +43,19 @@ class OptimizedGroupedModel(nn.Module):
         self.d_shared = d_shared
         self.aux_dim = aux_dim
 
-        # 辅助任务头
         self.enable_auxiliary_tasks = enable_auxiliary_tasks
         if enable_auxiliary_tasks:
             self.aux_task_head = MultiTaskHead(
                 d_in=d_shared + aux_dim,
-                task_type="a1",  # 辅助任务与主任务类型无关
+                task_type="a1",
                 enable_emotion_dims=enable_emotion_dims,
-                enable_emotion_cls=enable_emotion_cls,
-                enable_au_pred=enable_au_pred,
             )
 
-        # 不确定性加权
         self.use_uncertainty_weighting = use_uncertainty_weighting
         if use_uncertainty_weighting:
-            # 任务数量：主任务 + 会话任务 + 会话类型 + 辅助任务
             n_tasks = 3  # 主任务、会话任务、会话类型
-            if enable_auxiliary_tasks:
-                n_tasks += sum([enable_emotion_dims, enable_emotion_cls, enable_au_pred])
+            if enable_auxiliary_tasks and enable_emotion_dims:
+                n_tasks += 1
             self.uncertainty_loss = UncertaintyWeightedLoss(n_tasks=n_tasks)
 
     def forward(
@@ -121,22 +102,17 @@ def compute_optimized_loss(
     session_valid: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
-    # A1 损失参数
     use_combined_loss: bool = False,
     gamma_neg: float = 2.0,
     gamma_pos: float = 0.0,
     clip: float = 0.05,
     soft_f1_weight: float = 0.3,
-    # A2 损失参数
     use_corn_loss: bool = False,
     use_qwk_aux: bool = False,
     qwk_weight: float = 0.3,
-    # 固定权重（仅在不使用不确定性加权时生效）
     session_loss_weight: float = 0.5,
     session_type_loss_weight: float = 0.15,
-    emotion_dims_weight: float = 0.2,
-    emotion_cls_weight: float = 0.15,
-    au_pred_weight: float = 0.1,
+    emotion_dims_weight: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     计算优化后的总损失
@@ -220,35 +196,27 @@ def compute_optimized_loss(
     loss_dict["session_loss"] = sess_loss.item()
     loss_dict["session_type_loss"] = type_loss.item()
 
-    # 3. 辅助任务损失
+    # 3. 辅助任务损失 (仅 emotion_dims 弱正则化)
     if model.enable_auxiliary_tasks:
         aux_targets = targets.get("auxiliary_targets")
-        aux_outputs = {
-            k: v for k, v in outputs.items()
-            if k in ["emotion_dims", "emotion_cls", "au_logits"]
-        }
+        aux_outputs = {k: v for k, v in outputs.items() if k == "emotion_dims"}
         aux_losses = compute_auxiliary_losses(aux_outputs, aux_targets)
-
         for key, loss in aux_losses.items():
             losses.append(loss)
             loss_dict[f"aux_{key}"] = loss.item()
 
     # 4. 计算总损失
     if model.use_uncertainty_weighting:
-        # 使用不确定性加权
         total_loss, weights = model.uncertainty_loss(losses)
         loss_dict.update(weights)
     else:
-        # 使用固定权重
-        total_loss = losses[0]  # 主任务
-        total_loss = total_loss + session_loss_weight * losses[1]  # 会话任务
-        total_loss = total_loss + session_type_loss_weight * losses[2]  # 会话类型
+        total_loss = losses[0]
+        total_loss = total_loss + session_loss_weight * losses[1]
+        total_loss = total_loss + session_type_loss_weight * losses[2]
 
         if model.enable_auxiliary_tasks:
-            aux_weights = [emotion_dims_weight, emotion_cls_weight, au_pred_weight]
-            for i, w in enumerate(aux_weights):
-                if i + 3 < len(losses):
-                    total_loss = total_loss + w * losses[i + 3]
+            for i in range(3, len(losses)):
+                total_loss = total_loss + emotion_dims_weight * losses[i]
 
     loss_dict["total_loss"] = total_loss.item()
     return total_loss, loss_dict
@@ -285,8 +253,6 @@ def create_optimized_model(
         use_uncertainty_weighting=cfg.get("use_uncertainty_weighting", True),
         enable_auxiliary_tasks=cfg.get("enable_auxiliary_tasks", True),
         enable_emotion_dims=cfg.get("enable_emotion_dims", True),
-        enable_emotion_cls=cfg.get("enable_emotion_cls", True),
-        enable_au_pred=cfg.get("enable_au_pred", True),
     )
 
 
