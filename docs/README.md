@@ -137,8 +137,8 @@ Task Head (A1Head / A2OrdinalHead / CORALHead)
 
 利用训练时可用但测试时不可用的辅助属性（家庭结构、独生子女等 5 个维度）：
 
-- **Phase 1 — 多任务辅助监督**：从 participant_repr 预测辅助属性，迫使 backbone 学习相关潜变量
-- **Phase 2 — 样本一致性加权**：基于 aux_emotional 与 DASS 标签一致性识别错标样本
+- **Aux Heads — 辅助属性预测头**：从 participant_repr 预测辅助属性，迫使 backbone 学习相关潜变量
+- **Sample Reweight — 样本一致性加权**：基于 aux_emotional 与 DASS 标签一致性识别错标样本
 
 详见 `docs/AUX_LUPI_PLAN.md` 和 `docs/lupi/`。
 
@@ -164,11 +164,14 @@ conda activate adodas
 # A2 基线训练
 ./run_train.sh --task a2 --preset default
 
-# A2 + LUPI Phase1+2
-./run_train.sh --task a2 --preset default --lupi p1+p2
+# A2 全量优化（MTL + 增强损失，LUPI 关闭）
+./run_train.sh --task a2 --preset full
 
-# A2 MTL 预设 + LUPI Phase2
-./run_train.sh --task a2 --preset phase1 --lupi p2
+# A2 全量 + LUPI aux_heads
+./run_train.sh --task a2 --preset full --lupi heads
+
+# A2 全量 + LUPI 全部
+./run_train.sh --task a2 --preset full --lupi both
 
 # 快速调试
 ./run_train.sh --task a2 --preset debug
@@ -178,33 +181,51 @@ A2 各种训练模式
 # 基线（什么都不开）
 ./run_train.sh --task a2 --preset default
 
-# 仅 LUPI Phase 1（辅助属性预测头）
-./run_train.sh --task a2 --preset default --lupi p1
+# 仅 LUPI aux_heads（辅助属性预测头）
+./run_train.sh --task a2 --preset default --lupi heads
 
-# 仅 LUPI Phase 2（样本一致性加权）
-./run_train.sh --task a2 --preset default --lupi p2
+# 仅 LUPI sample_reweight（样本一致性加权）
+./run_train.sh --task a2 --preset default --lupi weight
 
-# Phase 1 + 2 都启用
-./run_train.sh --task a2 --preset default --lupi p1+p2
+# 两者都启用
+./run_train.sh --task a2 --preset default --lupi both
 
-# 原有 MTL 预设（不开 LUPI）
-./run_train.sh --task a2 --preset phase1
+# 全量 MTL 预设（LUPI 全部关闭）
+./run_train.sh --task a2 --preset full
 
-# 原有 MTL + LUPI Phase 2
-./run_train.sh --task a2 --preset phase1 --lupi p2
+# 全量 MTL + LUPI aux_heads
+./run_train.sh --task a2 --preset full --lupi heads
+
+# 全量 MTL + LUPI sample_reweight
+./run_train.sh --task a2 --preset full --lupi weight
+
+# 全量 MTL + LUPI 全部
+./run_train.sh --task a2 --preset full --lupi both
+```
+
+数据加载模式
+```bash
+# HDF5 全量预载（推荐：稳定、无 multiprocessing 死锁风险）
+./run_train.sh --task a2 --preset full --gpu 0 --extra "--use_hdf5 1 --preload 1"
+
+# HDF5 按需加载（内存更低，训练时 mmap 读盘）
+./run_train.sh --task a2 --preset full --gpu 0 --extra "--use_hdf5 1 --preload 0"
+
+# Raw 文件预载（需 preload_workers 控制并行数，过高易死锁）
+./run_train.sh --task a2 --preset full --gpu 0 --extra "--preload 1 --preload_workers 4"
 ```
 
 | preset | 配置 | 用途 |
 |--------|------|------|
 | `default` | `tasks/{task}/default.yaml` | 基线训练 |
-| `phase1` | `tasks/{task}/phase1_optimization.yaml` | MTL + 辅助任务 |
+| `full` | `tasks/{task}/mtl_full.yaml` | 全量优化 (MTL + 增强损失, LUPI 默认关闭) |
 | `debug` | default + 覆盖 | 100 人, 流式加载, 2 epochs 秒级启动 |
 
 ### 直接使用 train.py
 ```bash
 python train.py --task a2 --config tasks/a2/default.yaml
 python train.py --task a2 --config tasks/a2/default.yaml \
-    --aux_lupi_enabled 1 --aux_lupi_phase1 1 --aux_lupi_phase2 1
+    --aux_lupi_enabled 1 --aux_lupi_heads 1 --aux_lupi_reweight 1
 ```
 
 ### 推理

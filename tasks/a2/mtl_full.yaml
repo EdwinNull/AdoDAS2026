@@ -1,4 +1,4 @@
-# A1 任务第一阶段优化配置
+# A2 任务第一阶段优化配置
 # 基于 default.yaml，增加优化参数
 
 feature_root: /data1/AdoDas
@@ -16,9 +16,11 @@ feature_selection:
     - face_behavior
     - qc_stats
     - vad_agg
+    - body_pose
+    - global_motion
     - vision_ssl_embed
-  audio_ssl_model_tag: wav2vec2-chinese-xlsr
-  video_ssl_model_tag: dinov2-large
+  audio_ssl_model_tag: chinese-hubert-large
+  video_ssl_model_tag: vit-mae-base
 
 mask_policy: and_core
 core_audio: [mel_mfcc, ssl_embed]
@@ -37,6 +39,18 @@ dropout: 0.2
 d_shared: 256
 
 aggregator: mlp
+use_coral: true                   # 使用 CORAL head（改进的序数回归）
+
+# ============================================================
+# 跨模态交叉注意力（P1）
+# ============================================================
+use_cross_modal: false             # 启用双向跨模态注意力（TCN后、ASP前）
+cm_n_heads: 1                      # 跨模态注意力头数（小数据集建议1-2）
+
+# ============================================================
+# GPU 显存预占
+# ============================================================
+gpu_prealloc_gb: 27                # 启动时预占显存（GB），0=禁用
 
 # ============================================================
 # 辅助属性（Auxiliary Attributes）- 已有功能
@@ -47,13 +61,11 @@ use_aux_attrs: true              # 启用辅助属性编码
 aux_embed_dim: 8                 # 每个属性的 embedding 维度
 
 # ============================================================
-# 第一阶段优化：类别平衡损失函数（ASL + Soft-F1）
+# 第一阶段优化：序数回归增强损失（CORN + QWK）
 # ============================================================
-use_combined_loss: 1             # 启用 ASL + Soft-F1 联合损失
-gamma_neg: 2.0                   # ASL 负样本 focusing 参数（抑制简单负样本）
-gamma_pos: 0.0                   # ASL 正样本 focusing 参数（0=不抑制稀有正样本）
-clip: 0.05                       # ASL 概率截断阈值
-soft_f1_weight: 0.3              # Soft-F1 损失权重
+use_corn_loss: 1                  # 启用 CORN 条件序数损失（保证单调性）
+use_qwk_aux: 1                    # 启用可微 QWK 辅助损失（直接优化评价指标）
+qwk_weight: 0.3                   # QWK 损失权重
 
 # ============================================================
 # 不确定性加权多任务学习（Auxiliary Tasks）
@@ -75,24 +87,25 @@ emotion_dims_weight: 0.05
 batch_size: 64
 lr: 0.001
 weight_decay: 0.01
-warmup_epochs: 1
-epochs: 30
-seed: 42
+warmup_epochs: 3
+epochs: 40
+seed: 325799
 num_workers: 8
+preload_workers: 4                 # preload 并行数，不宜超过 8
 amp: true
 preload: true
 use_hdf5: false
 grad_clip: 1.0
 use_pos_weight: true
-patience: 8                       # 增加耐心，因为优化损失可能需要更多epoch收敛
-early_stop_metric: primary        # 使用主指标（F1）作为早停依据
+patience: 99
+early_stop_metric: val_loss       # A2使用验证损失作为早停依据
 
 # ============================================================
 # 数据增强与正则化
 # ============================================================
-label_smoothing: 0.05             # 标签平滑（从0.0增加到0.05）
-feature_noise_std: 0.01           # 特征高斯噪声（从0.0增加到0.01）
-session_drop_prob: 0.1            # 会话级dropout（从0.0增加到0.1）
+label_smoothing: 0.05             # 标签平滑
+feature_noise_std: 0.01           # 特征高斯噪声
+session_drop_prob: 0.1            # 会话级dropout
 
 # ============================================================
 # 提交配置
@@ -101,11 +114,10 @@ submission_level: participant
 decode_method: auto
 run_inference_after_train: true
 
-# LUPI: 辅助属性多任务监督 + 样本加权
 aux_lupi:
-  enabled: true
-  phase1_mtl:
-    enabled: true
+  enabled: false                     # 默认关闭，通过 --lupi 独立控制
+  aux_heads:                        # 从 participant_repr 预测 5 个辅助属性
+    enabled: false
     hidden: 64
     weights:
       aux_family: 0.05
@@ -113,7 +125,7 @@ aux_lupi:
       aux_favoritism: 0.05
       aux_academic: 0.15
       aux_emotional: 0.20
-  phase2_reweight:
+  sample_reweight:                  # 基于 aux_emotional 一致性做样本加权
     enabled: false
     method: emotional_consistency
     weight_low: 0.7

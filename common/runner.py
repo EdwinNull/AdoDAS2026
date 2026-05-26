@@ -120,8 +120,15 @@ def parse_args() -> argparse.Namespace:
 
     # LUPI 控制参数
     p.add_argument("--aux_lupi_enabled", type=int, default=None, help="1=enable LUPI aux supervision")
-    p.add_argument("--aux_lupi_phase1", type=int, default=None, help="1=enable Phase 1 aux attr heads")
-    p.add_argument("--aux_lupi_phase2", type=int, default=None, help="1=enable Phase 2 sample reweighting")
+    p.add_argument("--aux_lupi_heads", type=int, default=None, help="1=enable aux attribute prediction heads")
+    p.add_argument("--aux_lupi_reweight", type=int, default=None, help="1=enable sample consistency reweighting")
+
+    # 跨模态注意力参数
+    p.add_argument("--use_cross_modal", type=int, default=None, help="1=enable bidirectional cross-modal attention (TCN -> CM-Attn -> ASP)")
+    p.add_argument("--cm_n_heads", type=int, default=None, help="Number of heads for cross-modal attention")
+
+    # GPU 显存预占
+    p.add_argument("--gpu_prealloc_gb", type=float, default=None, help="Pre-allocate GPU memory in GB at startup (e.g. 27)")
 
     return p.parse_args()
 
@@ -401,9 +408,9 @@ def train_one_epoch_grouped(
     qwk_weight: float = 0.3,
     # LUPI 参数
     aux_lupi_weights: dict[str, float] | None = None,
-    phase2_reweight: bool = False,
-    phase2_w_low: float = 0.7,
-    phase2_w_high: float = 1.2,
+    lupi_reweight: bool = False,
+    reweight_w_low: float = 0.7,
+    reweight_w_high: float = 1.2,
 ) -> float:
     grouped_model.train()
     participant_head.train()
@@ -459,11 +466,11 @@ def train_one_epoch_grouped(
                     clip=clip,
                     soft_f1_weight=soft_f1_weight,
                 )
-                # Phase 2: per-sample reweight by aux consistency (additive)
+                # LUPI: per-sample reweight by aux consistency (additive)
                 rew_loss_a1 = p_logits.new_zeros(())
-                if phase2_reweight:
+                if lupi_reweight:
                     sample_w = _compute_aux_consistency_weight(
-                        batch, targets, device, phase2_w_low, phase2_w_high,
+                        batch, targets, device, reweight_w_low, reweight_w_high,
                     )
                     per_sample = F.binary_cross_entropy_with_logits(
                         p_logits.float(), targets.float(),
@@ -480,9 +487,9 @@ def train_one_epoch_grouped(
                     qwk_weight=qwk_weight,
                 )
                 rew_loss_a2 = p_logits.new_zeros(())
-                if phase2_reweight:
+                if lupi_reweight:
                     sample_w = _compute_aux_consistency_weight(
-                        batch, targets, device, phase2_w_low, phase2_w_high,
+                        batch, targets, device, reweight_w_low, reweight_w_high,
                     )
                     tgt = A2OrdinalHead.build_ordinal_targets(targets)
                     per_sample = F.binary_cross_entropy_with_logits(
@@ -524,7 +531,7 @@ def train_one_epoch_grouped(
                 sess_loss = p_logits.new_zeros(())
                 type_loss = p_logits.new_zeros(())
 
-            # LUPI Phase 1: 辅助属性预测损失
+            # LUPI: 辅助属性预测损失
             aux_loss = p_logits.new_zeros(())
             if out.get("aux_logits") is not None and aux_attrs is not None:
                 aux_loss, aux_acc = aux_attribute_loss(
@@ -532,7 +539,7 @@ def train_one_epoch_grouped(
                 )
 
             loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss + aux_loss
-            if phase2_reweight:
+            if lupi_reweight:
                 loss = loss + 0.3 * (rew_loss_a1 if task == "a1" else rew_loss_a2)
 
         optimizer.zero_grad()
@@ -592,9 +599,9 @@ def train_one_epoch_mtl(
     emotion_dims_weight: float = 0.05,
     # LUPI
     aux_lupi_weights: dict[str, float] | None = None,
-    phase2_reweight: bool = False,
-    phase2_w_low: float = 0.7,
-    phase2_w_high: float = 1.2,
+    lupi_reweight: bool = False,
+    reweight_w_low: float = 0.7,
+    reweight_w_high: float = 1.2,
 ) -> tuple[float, dict]:
     """
     使用MTL的训练循环
@@ -679,7 +686,7 @@ def train_one_epoch_mtl(
                 emotion_dims_weight=emotion_dims_weight,
             )
 
-            # LUPI Phase 1: 辅助属性预测损失
+            # LUPI: 辅助属性预测损失
             if outputs.get("aux_logits") is not None and aux_attrs is not None:
                 aux_loss, aux_acc = aux_attribute_loss(
                     outputs["aux_logits"], aux_attrs, weights=aux_lupi_weights,
@@ -687,11 +694,11 @@ def train_one_epoch_mtl(
                 loss = loss + aux_loss
                 loss_dict["aux_attr_loss"] = aux_loss.item()
 
-            # LUPI Phase 2: 样本一致性加权
-            if phase2_reweight:
+            # LUPI: 样本一致性加权
+            if lupi_reweight:
                 participant_y = targets["participant_y"]
                 sample_w = _compute_aux_consistency_weight(
-                    batch, participant_y, device, phase2_w_low, phase2_w_high,
+                    batch, participant_y, device, reweight_w_low, reweight_w_high,
                 )
                 if task == "a1":
                     per_sample = F.binary_cross_entropy_with_logits(
@@ -1141,9 +1148,9 @@ def main() -> None:
 
     # LUPI CLI 覆盖：将扁平 CLI 参数注入嵌套 aux_lupi 配置
     _lupi_overrides = {
-        "aux_lupi_enabled": ("enabled", args.aux_lupi_enabled),
-        "aux_lupi_phase1":  ("phase1_mtl.enabled", args.aux_lupi_phase1),
-        "aux_lupi_phase2":  ("phase2_reweight.enabled", args.aux_lupi_phase2),
+        "aux_lupi_enabled":  ("enabled", args.aux_lupi_enabled),
+        "aux_lupi_heads":    ("aux_heads.enabled", args.aux_lupi_heads),
+        "aux_lupi_reweight": ("sample_reweight.enabled", args.aux_lupi_reweight),
     }
     for _arg_name, (_cfg_path, _val) in _lupi_overrides.items():
         if _val is not None:
@@ -1155,6 +1162,17 @@ def main() -> None:
 
     seed_everything(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # GPU 显存预占：分配后释放，CUDA 缓存分配器保留内存池防止其他进程抢占
+    gpu_prealloc_gb = cfg.get("gpu_prealloc_gb", 0)
+    if device.type == "cuda" and gpu_prealloc_gb > 0:
+        _n_floats = int(gpu_prealloc_gb * 1024**3 / 4)
+        log.info(f"Pre-allocating {gpu_prealloc_gb:.1f} GB GPU memory...")
+        _t = torch.zeros(_n_floats, dtype=torch.float32, device=device)
+        del _t
+        torch.cuda.empty_cache()
+        _free, _total = torch.cuda.mem_get_info()
+        log.info(f"GPU memory: {(_total-_free)/1024**3:.1f} GB used / {_total/1024**3:.1f} GB total")
 
     output_root = Path(cfg.get("output_dir", "./output"))
     manifest_dir = Path(cfg.get("manifest_dir", "/data1/AdoDas"))
@@ -1272,6 +1290,8 @@ def main() -> None:
         asp_beta=cfg.get("asp_beta", 0.5),
         dropout=cfg.get("dropout", 0.2),
         d_shared=cfg.get("d_shared", 256),
+        use_cross_modal=bool(cfg.get("use_cross_modal", False)),
+        cm_n_heads=cfg.get("cm_n_heads", 1),
     )
 
     backbone = MTCNBackbone(bb_cfg)
@@ -1287,16 +1307,16 @@ def main() -> None:
         aux_dim = aux_encoder.output_dim
         log.info(f"Auxiliary attributes enabled: embed_dim={aux_embed_dim}, output_dim={aux_dim}")
 
-    # 创建辅助属性预测头（LUPI Phase 1）
+    # 创建辅助属性预测头（LUPI）
     aux_heads = None
     aux_lupi_cfg = cfg.get("aux_lupi", {})
-    if aux_lupi_cfg.get("enabled", False) and aux_lupi_cfg.get("phase1_mtl", {}).get("enabled", False):
+    if aux_lupi_cfg.get("enabled", False) and aux_lupi_cfg.get("aux_heads", {}).get("enabled", False):
         aux_heads = AuxAttributeHeads(
             d_in=bb_cfg.d_shared,
-            hidden=cfg.get("aux_lupi", {}).get("phase1_mtl", {}).get("hidden", 64),
+            hidden=cfg.get("aux_lupi", {}).get("aux_heads", {}).get("hidden", 64),
             dropout=cfg.get("dropout", 0.2),
         )
-        log.info(f"LUPI Phase 1 (aux attribute heads) enabled")
+        log.info(f"LUPI aux heads enabled")
 
     grouped_model = GroupedModel(
         backbone=backbone,
@@ -1401,20 +1421,20 @@ def main() -> None:
     log.info(f"Session loss weight: {session_loss_weight}")
     log.info(f"Session type loss weight: {session_type_loss_weight}")
 
-    # LUPI Phase 1 辅助属性监督权重
+    # LUPI 辅助属性监督权重
     aux_lupi_weights = None
-    if aux_lupi_cfg.get("enabled") and aux_lupi_cfg.get("phase1_mtl", {}).get("enabled"):
-        aux_lupi_weights = aux_lupi_cfg.get("phase1_mtl", {}).get("weights", {
+    if aux_lupi_cfg.get("enabled") and aux_lupi_cfg.get("aux_heads", {}).get("enabled"):
+        aux_lupi_weights = aux_lupi_cfg.get("aux_heads", {}).get("weights", {
             "aux_family": 0.05, "aux_only_child": 0.05, "aux_favoritism": 0.05,
             "aux_academic": 0.15, "aux_emotional": 0.20,
         })
         log.info(f"LUPI aux weights: {aux_lupi_weights}")
 
-    # LUPI Phase 2 样本加权
-    phase2_enabled = aux_lupi_cfg.get("enabled") and aux_lupi_cfg.get("phase2_reweight", {}).get("enabled", False)
-    if phase2_enabled:
-        phase2_cfg = aux_lupi_cfg["phase2_reweight"]
-        log.info(f"LUPI Phase 2 reweight enabled: method={phase2_cfg.get('method', 'emotional_consistency')}")
+    # LUPI 样本一致性加权
+    reweight_enabled = aux_lupi_cfg.get("enabled") and aux_lupi_cfg.get("sample_reweight", {}).get("enabled", False)
+    if reweight_enabled:
+        reweight_cfg = aux_lupi_cfg["sample_reweight"]
+        log.info(f"LUPI sample reweight enabled: method={reweight_cfg.get('method', 'emotional_consistency')}")
 
     patience = cfg.get("patience", 8)
     early_stop_metric = cfg.get("early_stop_metric", "val_loss")
@@ -1464,9 +1484,9 @@ def main() -> None:
                 session_type_loss_weight=session_type_loss_weight,
                 emotion_dims_weight=cfg.get("emotion_dims_weight", 0.05),
                 aux_lupi_weights=aux_lupi_weights,
-                phase2_reweight=phase2_enabled,
-                phase2_w_low=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_low", 0.7) if phase2_enabled else 0.7,
-                phase2_w_high=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_high", 1.2) if phase2_enabled else 1.2,
+                lupi_reweight=reweight_enabled,
+                reweight_w_low=aux_lupi_cfg.get("sample_reweight", {}).get("weight_low", 0.7) if reweight_enabled else 0.7,
+                reweight_w_high=aux_lupi_cfg.get("sample_reweight", {}).get("weight_high", 1.2) if reweight_enabled else 1.2,
             )
             # 记录详细损失
             if epoch % 5 == 0 or epoch == 1:
@@ -1490,9 +1510,9 @@ def main() -> None:
                 use_qwk_aux=bool(cfg.get("use_qwk_aux", False)),
                 qwk_weight=cfg.get("qwk_weight", 0.3),
                 aux_lupi_weights=aux_lupi_weights,
-                phase2_reweight=phase2_enabled,
-                phase2_w_low=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_low", 0.7) if phase2_enabled else 0.7,
-                phase2_w_high=aux_lupi_cfg.get("phase2_reweight", {}).get("weight_high", 1.2) if phase2_enabled else 1.2,
+                lupi_reweight=reweight_enabled,
+                reweight_w_low=aux_lupi_cfg.get("sample_reweight", {}).get("weight_low", 0.7) if reweight_enabled else 0.7,
+                reweight_w_high=aux_lupi_cfg.get("sample_reweight", {}).get("weight_high", 1.2) if reweight_enabled else 1.2,
             )
 
         # 验证（MTL和标准模式都使用相同的验证函数）

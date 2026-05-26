@@ -18,8 +18,8 @@ EXTRA_ARGS=()
 declare -A PRESET_CONFIG
 PRESET_CONFIG["default_a1"]="tasks/a1/default.yaml"
 PRESET_CONFIG["default_a2"]="tasks/a2/default.yaml"
-PRESET_CONFIG["phase1_a1"]="tasks/a1/phase1_optimization.yaml"
-PRESET_CONFIG["phase1_a2"]="tasks/a2/phase1_optimization.yaml"
+PRESET_CONFIG["full_a1"]="tasks/a1/mtl_full.yaml"
+PRESET_CONFIG["full_a2"]="tasks/a2/mtl_full.yaml"
 
 usage() {
     cat << 'EOF'
@@ -29,15 +29,15 @@ usage() {
   --task a1|a2         任务 (默认: a2)
   --preset name         配置预设:
                           default   - 基线配置
-                          phase1    - Phase 1 优化 (MTL + 辅助任务)
+                          full      - 全量优化 (MTL + 增强损失, LUPI 默认关闭)
                           debug     - 快速调试 (小模型, 2 epochs)
   --lupi mode           LUPI 模式:
-                          p1        - Phase 1: 辅助属性预测头
-                          p2        - Phase 2: 样本一致性加权
-                          p1+p2     - Phase 1 + 2 同时启用
+                          heads     - 辅助属性预测头
+                          weight    - 样本一致性加权
+                          both      - 两者同时启用
   --gpu N               GPU ID (默认: 0)
   --name <run_name>     自定义运行名称 (默认: 自动生成)
-  --extra "..."         传递给 train.py 的额外参数
+  --extra "..."         传递给 train.py 的额外参数 (用于控制数据加载、跨模态注意力等)
   -h, --help            显示此帮助
 
 环境变量:
@@ -46,11 +46,24 @@ usage() {
   ADODAS_OUTPUT_ROOT    输出根目录 (默认: /data1/AdoDas/output)
 
 示例:
-  ./run_train.sh --task a2 --preset default                 # A2 基线训练
-  ./run_train.sh --task a2 --preset default --lupi p1       # A2 + LUPI Phase1
-  ./run_train.sh --task a2 --preset default --lupi p1+p2    # A2 + LUPI Phase1+2
-  ./run_train.sh --task a2 --preset phase1 --lupi p2        # A2 MTL + LUPI Phase2
-  ./run_train.sh --task a2 --preset debug --gpu 1           # A2 快速调试
+  ./run_train.sh --task a2 --preset default                   # A2 基线训练
+  ./run_train.sh --task a2 --preset full --gpu 0              # A2 全量优化
+  ./run_train.sh --task a2 --preset default --lupi heads      # A2 + LUPI aux_heads
+  ./run_train.sh --task a2 --preset default --lupi both       # A2 + LUPI 全部
+  ./run_train.sh --task a2 --preset full --lupi weight        # A2 全量 + sample_reweight
+  ./run_train.sh --task a2 --preset debug --gpu 1             # A2 快速调试
+
+数据加载 (通过 --extra 控制):
+  # HDF5 全量预载（推荐：稳定快速）
+  --extra "--use_hdf5 1 --preload 1"
+  # HDF5 按需加载（低内存，mmap 读盘）
+  --extra "--use_hdf5 1 --preload 0"
+  # Raw 文件预载（控制并行数防死锁）
+  --extra "--preload 1 --preload_workers 4"
+
+跨模态注意力 (P1):
+  # 开启
+  --extra "--use_cross_modal 1"
 EOF
     exit 0
 }
@@ -85,19 +98,19 @@ fi
 
 # ---- 解析 LUPI 模式 ----
 case "$LUPI" in
-    p1)
-        EXTRA_ARGS+=(--aux_lupi_enabled 1 --aux_lupi_phase1 1)
+    heads)
+        EXTRA_ARGS+=(--aux_lupi_enabled 1 --aux_lupi_heads 1)
         ;;
-    p2)
-        EXTRA_ARGS+=(--aux_lupi_enabled 1 --aux_lupi_phase2 1)
+    weight)
+        EXTRA_ARGS+=(--aux_lupi_enabled 1 --aux_lupi_reweight 1)
         ;;
-    p1+p2)
-        EXTRA_ARGS+=(--aux_lupi_enabled 1 --aux_lupi_phase1 1 --aux_lupi_phase2 1)
+    both)
+        EXTRA_ARGS+=(--aux_lupi_enabled 1 --aux_lupi_heads 1 --aux_lupi_reweight 1)
         ;;
     "")
         ;;
     *)
-        echo "错误: --lupi 必须是 p1 / p2 / p1+p2，得到: $LUPI"
+        echo "错误: --lupi 必须是 heads / weight / both，得到: $LUPI"
         exit 1
         ;;
 esac
@@ -107,8 +120,8 @@ CONFIG=""
 case "$PRESET" in
     default)
         CONFIG="${PRESET_CONFIG["default_$TASK"]}" ;;
-    phase1)
-        CONFIG="${PRESET_CONFIG["phase1_$TASK"]}" ;;
+    full)
+        CONFIG="${PRESET_CONFIG["full_$TASK"]}" ;;
     debug)
         # 快速调试：用 default config + 覆盖参数
         CONFIG="${PRESET_CONFIG["default_$TASK"]}"
@@ -123,7 +136,7 @@ case "$PRESET" in
             CONFIG="$PRESET"
         else
             echo "错误: 未知预设 '$PRESET'，且不是有效的配置文件路径"
-            echo "可用预设: default, phase1, debug"
+            echo "可用预设: default, full, debug"
             exit 1
         fi
         ;;
@@ -165,6 +178,7 @@ echo "============================================================"
 
 # ---- 启动训练 ----
 export CUDA_VISIBLE_DEVICES="$GPU"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 if command -v conda &>/dev/null; then
     eval "$(conda shell.bash hook)"

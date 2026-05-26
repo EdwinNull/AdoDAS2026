@@ -29,8 +29,8 @@ conda activate adodas
 # A2 基线训练
 ./run_train.sh --task a2 --preset default
 
-# A2 MTL + LUPI Phase1+2 同时启用
-./run_train.sh --task a2 --preset default --lupi p1+p2
+# A2 MTL + LUPI 全部启用
+./run_train.sh --task a2 --preset default --lupi both
 
 # A1 快速调试（小模型, 2 epochs, 验证 pipeline）
 ./run_train.sh --task a1 --preset debug
@@ -43,15 +43,15 @@ conda activate adodas
 | preset | 配置 | 用途 |
 |--------|------|------|
 | `default` | `tasks/{task}/default.yaml` | 基线训练 |
-| `phase1` | `tasks/{task}/phase1_optimization.yaml` | MTL + 辅助任务 + 增强损失 |
+| `full` | `tasks/{task}/mtl_full.yaml` | MTL + 增强损失 + LUPI |
 | `debug` | default + 覆盖参数 | 100人, 流式加载, 2 epochs 秒级启动 |
 
 `--lupi` 模式：
 | 值 | 效果 |
 |----|------|
-| `p1` | 启用 Phase 1: 辅助属性预测头 |
-| `p2` | 启用 Phase 2: 样本一致性加权 |
-| `p1+p2` | 同时启用 Phase 1 + 2 |
+| `heads` | 启用辅助属性预测头 |
+| `weight` | 启用样本一致性加权 |
+| `both` | 两者同时启用 |
 
 ### 直接使用 train.py
 
@@ -59,9 +59,9 @@ conda activate adodas
 # A2 训练
 python train.py --task a2 --config tasks/a2/default.yaml
 
-# A2 + LUPI Phase1+2 (CLI 覆盖)
+# A2 + LUPI aux heads + sample reweight (CLI 覆盖)
 python train.py --task a2 --config tasks/a2/default.yaml \
-    --aux_lupi_enabled 1 --aux_lupi_phase1 1 --aux_lupi_phase2 1
+    --aux_lupi_enabled 1 --aux_lupi_heads 1 --aux_lupi_reweight 1
 
 # A1 训练
 python train.py --task a1 --config tasks/a1/default.yaml
@@ -137,7 +137,7 @@ python test_phase1_optimization.py
   - CORALHead: Ordinal regression head with learnable thresholds
 - `heads.py`: Task-specific prediction heads
   - A1Head, A2OrdinalHead: Task heads
-  - AuxAttributeHeads: LUPI Phase 1 — predicts 5 aux attributes from participant_repr
+  - AuxAttributeHeads: LUPI — predicts 5 aux attributes from participant_repr
   - Losses: ASL, Soft-F1, CORN, QWK, aux_attribute_loss
 - `aux_encoder.py`: Encodes 5 auxiliary attributes as input features (embeddings)
 - `mtl_uncertainty.py`: Uncertainty-weighted multi-task learning
@@ -167,7 +167,7 @@ YAML configs in `tasks/{a1,a2}/`:
 ```yaml
 aux_lupi:
   enabled: true              # 总开关, false 时完全回退到 baseline
-  phase1_mtl:                # Phase 1: 辅助属性多任务监督
+  aux_heads:                 # 辅助属性预测头
     enabled: true            #   从 participant_repr 预测 5 个辅助属性
     hidden: 64
     weights:                 #   各类别损失权重 (总应为主任务 1/3 ~ 1/2)
@@ -176,7 +176,7 @@ aux_lupi:
       aux_favoritism: 0.05
       aux_academic: 0.15
       aux_emotional: 0.20
-  phase2_reweight:           # Phase 2: 样本一致性加权
+  sample_reweight:           # 样本一致性加权
     enabled: false           #   基于 aux_emotional vs DASS 标签一致性
     method: emotional_consistency
     weight_low: 0.7          #   冲突样本降权 (可能是错标)
@@ -185,10 +185,10 @@ aux_lupi:
 
 CLI 覆盖参数：
 - `--aux_lupi_enabled 1` — 总开关
-- `--aux_lupi_phase1 1` — Phase 1
-- `--aux_lupi_phase2 1` — Phase 2
+- `--aux_lupi_heads 1` — 辅助属性预测头
+- `--aux_lupi_reweight 1` — 样本一致性加权
 
-Phase 1 和 Phase 2 可独立启用，不互相依赖。所有 LUPI 改动遵循 LUPI 范式：训练时使用辅助属性作为监督信号，推理时不依赖辅助属性。
+两个机制可独立启用，不互相依赖。遵循 LUPI 范式：训练时使用辅助属性作为监督信号，推理时不依赖辅助属性。
 
 ### Auxiliary Attributes (5 categorical features)
 
@@ -271,20 +271,20 @@ Encoded via `AuxiliaryAttributeEncoder` with embedding layers, concatenated to p
 - **Submission level**: Can be "session" or "participant". Participant-level averages 4 session predictions.
 - **Decode method for A2**: "auto" selects best on validation (argmax/expectation/monotonic)
 - **LUPI disabled by default**: `aux_lupi.enabled: false` in default.yaml. Must explicitly enable via YAML or CLI `--aux_lupi_enabled 1`.
-- **LUPI Phase 1 requires aux_attrs in batch**: `aux_favoritism` has ~35% structural missing (only-child → no favoritism). Loss masking handles this via `valid_mask = targets >= 0`.
-- **Phase 2 non-MTL vs MTL**: Phase 2 adds a weighted BCE term (coefficient 0.3) — it does NOT replace the main loss. Enhanced losses (ASL, CORN, QWK) are preserved.
+- **LUPI aux heads requires aux_attrs in batch**: `aux_favoritism` has ~35% structural missing (only-child → no favoritism). Loss masking handles this via `valid_mask = targets >= 0`.
+- **Sample reweight non-MTL vs MTL**: Sample reweight adds a weighted BCE term (coefficient 0.3) — it does NOT replace the main loss. Enhanced losses (ASL, CORN, QWK) are preserved.
 - **Checkpoint compatibility**: `infer.py` loads with `strict=False` to tolerate missing/extra aux_heads keys.
 
 ### LUPI Implementation (Learning Using Privileged Information)
 
-训练时辅助属性（5 个类别特征）可用，测试时不可用。两个阶段：
+训练时辅助属性（5 个类别特征）可用，测试时不可用。两个机制：
 
-**Phase 1 — 多任务辅助监督** (`common/models/heads.py: AuxAttributeHeads`)
+**Aux Heads — 辅助属性预测** (`common/models/heads.py: AuxAttributeHeads`)
 - 从 participant_repr (纯音视频表示) 预测 5 个辅助属性
 - 损失：加权 CrossEntropy，自动跳过缺失值（-1 mask）
 - 设计原理：迫使 backbone 学习编码辅助属性相关的潜变量
 
-**Phase 2 — 样本一致性加权** (`common/runner.py: _compute_aux_consistency_weight`)
+**Sample Reweight — 样本一致性加权** (`common/runner.py: _compute_aux_consistency_weight`)
 - 利用 `aux_emotional` (情绪变动) 与 DASS 标签的一致性识别可能错标样本
 - DASS 阳性 + 情绪变差 → 高权重; DASS 阳性 + 情绪变好 → 低权重
 - 在非 MTL 模式下替换主损失为加权 per-sample BCE; MTL 模式下作为附加项
@@ -292,18 +292,18 @@ Encoded via `AuxiliaryAttributeEncoder` with embedding layers, concatenated to p
 **关键约束**:
 1. 推理时不依赖辅助属性 (strict=False loading, aux_logits=None 时跳过)
 2. `aux_lupi.enabled: false` 完全回退到 baseline 行为
-3. Phase 1/2 独立可切换，不互相依赖
+3. 两个机制独立可切换，不互相依赖
 
 详见 `docs/AUX_LUPI_PLAN.md`。
 
-### Phase 1 Optimizations (feature/auxiliary-attributes branch)
+### Optimizations (mtl_full.yaml)
 
 - Uncertainty-weighted multi-task learning (automatic task balancing)
-- Auxiliary tasks: emotion dimensions, emotion classification, AU prediction
+- Auxiliary tasks: emotion_dims as weak regularizer
 - Class-balanced loss functions: ASL + Soft-F1 for A1, CORN + QWK-aux for A2
+- Cross-modal attention (P1) — bidirectional A↔V temporal attention
 - Auxiliary attribute encoding (5 demographic/behavioral features)
-
-See `docs/phase1/` for detailed documentation.
+- GPU memory pre-allocation
 
 ## Documentation
 

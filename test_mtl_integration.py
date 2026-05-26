@@ -331,7 +331,7 @@ def main():
         print("🎉 所有测试通过！MTL集成完成。")
         print()
         print("下一步：运行训练")
-        print("  python train.py --task a1 --config tasks/a1/phase1_optimization.yaml")
+        print("  python train.py --task a2 --config tasks/a2/mtl_full.yaml")
     else:
         print("❌ 部分测试失败，请检查错误信息。")
 

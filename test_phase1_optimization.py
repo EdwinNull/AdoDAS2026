@@ -270,9 +270,7 @@ def main():
         print("✓ 所有测试通过！")
         print("="*60)
         print("\n可以开始使用优化模块进行训练：")
-        print("  python train.py --task a1 --config configs/phase1_optimization.yaml")
-        print("\n详细文档请参考：")
-        print("  docs/PHASE1_OPTIMIZATION_GUIDE.md")
+        print("  python train.py --task a2 --config tasks/a2/mtl_full.yaml")
 
     except Exception as e:
         print(f"\n✗ 测试失败: {e}")

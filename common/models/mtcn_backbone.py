@@ -127,6 +127,9 @@ class BackboneConfig:
     d_session: int = 16
     d_shared: int = 256
 
+    use_cross_modal: bool = False
+    cm_n_heads: int = 1
+
 class GroupAdapter(nn.Module):
     """特征适配层
 
@@ -502,6 +505,118 @@ class ASP(nn.Module):
         # Step 4: 拼接均值和标准差，输出 2D 维向量
         return torch.cat([mean, std], dim=-1)
 
+class CrossModalAttention(nn.Module):
+    """跨模态交叉注意力层
+
+    Q 来自模态 A，K/V 来自模态 B → 模态 A 的每个时间步可以"关注"模态 B
+    中最相关的时间步，获取互补信息。
+
+    包含可学习门控：基于两模态全局统计量决定跨模态信息的混合比例，
+    当互补模态缺失或质量低时自动退化为恒等映射。
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 1, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.drop_attn = nn.Dropout(dropout)
+        self.drop_out = nn.Dropout(dropout)
+
+        # 门控：基于两模态全局统计量决定跨模态信息混合比例
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        query_mask: torch.Tensor,
+        kv_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """返回 query 模态经跨模态注意力增强后的特征 (B, T_q, D)"""
+        B, T_q, D = query.shape
+        T_kv = key_value.size(1)
+
+        residual = query
+
+        # 计算门控值：基于两模态的全局均值池化
+        q_pooled = query.sum(dim=1) / query_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+        kv_pooled = key_value.sum(dim=1) / kv_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+        gate_val = self.gate(torch.cat([q_pooled, kv_pooled], dim=-1))  # (B, 1)
+
+        # Pre-Norm + 多头注意力
+        q_norm = self.norm_q(query)
+        kv_norm = self.norm_kv(key_value)
+
+        Q = self.W_q(q_norm).view(B, T_q, self.n_heads, self.d_head).transpose(1, 2)
+        K = self.W_k(kv_norm).view(B, T_kv, self.n_heads, self.d_head).transpose(1, 2)
+        V = self.W_v(kv_norm).view(B, T_kv, self.n_heads, self.d_head).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        attn_mask = kv_mask.unsqueeze(1).unsqueeze(2)
+        scores = scores.masked_fill(~attn_mask, float("-inf"))
+        weights = F.softmax(scores, dim=-1)
+        weights = weights.masked_fill(~attn_mask, 0.0)
+        weights = self.drop_attn(weights)
+
+        out = torch.matmul(weights, V)
+        out = out.transpose(1, 2).contiguous().view(B, T_q, D)
+        out = self.drop_out(self.W_o(out))
+
+        # 门控残差：gate=0 时退化为恒等映射（原模态不变）
+        out = residual + gate_val.unsqueeze(1) * out
+        out = out * query_mask.unsqueeze(-1).float()
+        return out
+
+
+class BidirectionalCrossModalFusion(nn.Module):
+    """双向跨模态融合
+
+    同时让音频关注视频、视频关注音频，实现信息双向流动。
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.audio_attends_video = CrossModalAttention(d_model, n_heads, dropout)
+        self.video_attends_audio = CrossModalAttention(d_model, n_heads, dropout)
+
+    def forward(
+        self,
+        audio: torch.Tensor,
+        video: torch.Tensor,
+        mask_audio: torch.Tensor,
+        mask_video: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 若一模态完全缺失，跳过该方向的跨模态注意力
+        has_video = mask_video.any(dim=1)  # (B,)
+        has_audio = mask_audio.any(dim=1)
+
+        audio_enriched = audio
+        video_enriched = video
+
+        if has_video.any():
+            audio_enriched = self.audio_attends_video(audio, video, mask_audio, mask_video)
+        if has_audio.any():
+            video_enriched = self.video_attends_audio(video, audio, mask_video, mask_audio)
+
+        return audio_enriched, video_enriched
+
+
 class MTCNBackbone(nn.Module):
     """多模态 TCN 骨干网络 (Multi-modal Temporal Convolutional Network Backbone)
 
@@ -613,6 +728,13 @@ class MTCNBackbone(nn.Module):
         self.audio_tcn = TCN(cfg.d_model, cfg.tcn_layers, cfg.tcn_kernel_size, cfg.dropout)
         self.video_tcn = TCN(cfg.d_model, cfg.tcn_layers, cfg.tcn_kernel_size, cfg.dropout)
 
+        # ── 跨模态融合（可选） ──────────────────────────────────────────────
+        self.use_cross_modal = cfg.use_cross_modal
+        if self.use_cross_modal:
+            self.cross_modal = BidirectionalCrossModalFusion(
+                cfg.d_model, cfg.cm_n_heads, cfg.dropout
+            )
+
         # ── 注意力统计池化 ──────────────────────────────────────────────
         self.audio_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
         self.video_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
@@ -709,6 +831,10 @@ class MTCNBackbone(nn.Module):
 
         a = self.audio_tcn(a, mask_a)          # 4层膨胀卷积，感受野逐层扩大
         v = self.video_tcn(v, mask_v)
+
+        # ── Step 3.5: 跨模态交叉注意力（可选） ────────────────────────────
+        if self.use_cross_modal:
+            a, v = self.cross_modal(a, v, mask_a, mask_v)
 
         # ── Step 4: ASP 统计池化 ─────────────────────────────────────────
         # 利用 VAD 和 QC 信号引导注意力，压缩时序 → 固定大小统计量
