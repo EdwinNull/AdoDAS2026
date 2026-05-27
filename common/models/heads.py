@@ -429,6 +429,7 @@ def a2_ordinal_loss(
     use_corn: bool = False,
     use_qwk: bool = False,
     qwk_weight: float = 0.3,
+    loss_components: dict | None = None,
 ) -> torch.Tensor:
     """
     A2 增强序数回归损失（兼容 runner.py 调用接口）
@@ -474,6 +475,8 @@ def a2_ordinal_loss(
     if use_qwk:
         qwk_loss = differentiable_qwk_loss(logits, labels, n_thresholds=n_thresholds)
         total_loss = total_loss + qwk_weight * qwk_loss
+        if loss_components is not None:
+            loss_components["qwk_loss"] = qwk_loss.item()
 
     return total_loss
 

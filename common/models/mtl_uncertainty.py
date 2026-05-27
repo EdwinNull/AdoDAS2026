@@ -33,9 +33,10 @@ class UncertaintyWeightedLoss(nn.Module):
         n_tasks: 任务数量
         init_log_var: 初始 log(σ²) 值（默认0，即 σ²=1）
     """
-    def __init__(self, n_tasks: int, init_log_var: float = 0.0):
+    def __init__(self, n_tasks: int, init_log_var: float = 0.0, log_var_clamp: float | None = None):
         super().__init__()
         self.n_tasks = n_tasks
+        self.log_var_clamp = log_var_clamp
         # 可学习参数：log(σ²)，用 log 保证 σ² > 0
         self.log_vars = nn.Parameter(torch.full((n_tasks,), init_log_var, dtype=torch.float32))
 
@@ -55,15 +56,18 @@ class UncertaintyWeightedLoss(nn.Module):
         weights = {}
 
         for i, loss in enumerate(losses):
+            log_var = self.log_vars[i]
+            if self.log_var_clamp is not None:
+                log_var = torch.clamp(log_var, -self.log_var_clamp, self.log_var_clamp)
             # 不确定性加权公式：(1 / 2σ²) × L + log(σ)
             # = (1 / 2exp(log_var)) × L + 0.5 × log_var
-            precision = torch.exp(-self.log_vars[i])  # 1/σ²
-            weighted_loss = 0.5 * precision * loss + 0.5 * self.log_vars[i]
+            precision = torch.exp(-log_var)  # 1/σ²
+            weighted_loss = 0.5 * precision * loss + 0.5 * log_var
             total_loss = total_loss + weighted_loss
 
             # 记录有效权重（用于监控）
             weights[f"task_{i}_weight"] = precision.item()
-            weights[f"task_{i}_sigma"] = torch.exp(0.5 * self.log_vars[i]).item()
+            weights[f"task_{i}_sigma"] = torch.exp(0.5 * log_var).item()
 
         return total_loss, weights
 

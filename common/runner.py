@@ -374,7 +374,7 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
         vals = df[col].values.astype(int)
         for k in range(n_thresholds):
             p = max(np.mean(vals >= (k + 1)), 1e-6)
-            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, 10.0)
+            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, 5.0)
     return torch.from_numpy(pw).unsqueeze(0)
 
 def train_one_epoch_grouped(
@@ -1166,13 +1166,19 @@ def main() -> None:
     # GPU 显存预占：分配后释放，CUDA 缓存分配器保留内存池防止其他进程抢占
     gpu_prealloc_gb = cfg.get("gpu_prealloc_gb", 0)
     if device.type == "cuda" and gpu_prealloc_gb > 0:
-        _n_floats = int(gpu_prealloc_gb * 1024**3 / 4)
-        log.info(f"Pre-allocating {gpu_prealloc_gb:.1f} GB GPU memory...")
-        _t = torch.zeros(_n_floats, dtype=torch.float32, device=device)
-        del _t
-        torch.cuda.empty_cache()
         _free, _total = torch.cuda.mem_get_info()
-        log.info(f"GPU memory: {(_total-_free)/1024**3:.1f} GB used / {_total/1024**3:.1f} GB total")
+        _free_gb = _free / 1024**3
+        if _free_gb < gpu_prealloc_gb:
+            log.warning(f"GPU free memory ({_free_gb:.1f} GB) < prealloc target ({gpu_prealloc_gb:.1f} GB), "
+                        f"skipping pre-allocation. Other processes are using this GPU.")
+        else:
+            _n_floats = int(gpu_prealloc_gb * 1024**3 / 4)
+            log.info(f"Pre-allocating {gpu_prealloc_gb:.1f} GB GPU memory...")
+            _t = torch.zeros(_n_floats, dtype=torch.float32, device=device)
+            del _t
+            torch.cuda.empty_cache()
+            _free2, _total2 = torch.cuda.mem_get_info()
+            log.info(f"GPU memory: {(_total2-_free2)/1024**3:.1f} GB used / {_total2/1024**3:.1f} GB total")
 
     output_root = Path(cfg.get("output_dir", "./output"))
     manifest_dir = Path(cfg.get("manifest_dir", "/data1/AdoDas"))
@@ -1439,8 +1445,9 @@ def main() -> None:
     patience = cfg.get("patience", 8)
     early_stop_metric = cfg.get("early_stop_metric", "val_loss")
     es_mode = "min" if early_stop_metric == "val_loss" else "max"
-    early_stop = EarlyStopping(patience=patience, mode=es_mode)
-    log.info(f"EarlyStopping: patience={patience}, metric={early_stop_metric}, mode={es_mode}")
+    es_min_delta = cfg.get("early_stop_min_delta", 0.005 if early_stop_metric == "primary" else 0.0)
+    early_stop = EarlyStopping(patience=patience, mode=es_mode, min_delta=es_min_delta)
+    log.info(f"EarlyStopping: patience={patience}, metric={early_stop_metric}, mode={es_mode}, min_delta={es_min_delta}")
 
     label_smoothing = cfg.get("label_smoothing", 0.05)
     feature_noise_std = cfg.get("feature_noise_std", 0.01)

@@ -35,6 +35,7 @@ class OptimizedGroupedModel(nn.Module):
         use_uncertainty_weighting: bool = True,
         enable_auxiliary_tasks: bool = True,
         enable_emotion_dims: bool = True,
+        uw_log_var_clamp: float | None = None,
     ):
         super().__init__()
         self.grouped_model = grouped_model
@@ -56,7 +57,7 @@ class OptimizedGroupedModel(nn.Module):
             n_tasks = 3  # 主任务、会话任务、会话类型
             if enable_auxiliary_tasks and enable_emotion_dims:
                 n_tasks += 1
-            self.uncertainty_loss = UncertaintyWeightedLoss(n_tasks=n_tasks)
+            self.uncertainty_loss = UncertaintyWeightedLoss(n_tasks=n_tasks, log_var_clamp=uw_log_var_clamp)
 
     def forward(
         self,
@@ -128,6 +129,7 @@ def compute_optimized_loss(
     loss_dict = {}
 
     # 1. 主任务损失（参与者级）
+    loss_components: dict[str, float] = {}
     if task == "a1":
         main_loss = a1_loss(
             outputs["participant_logits"],
@@ -149,9 +151,11 @@ def compute_optimized_loss(
             use_corn=use_corn_loss,
             use_qwk=use_qwk_aux,
             qwk_weight=qwk_weight,
+            loss_components=loss_components,
         )
     losses.append(main_loss)
     loss_dict["main_loss"] = main_loss.item()
+    loss_dict.update({f"main_{k}": v for k, v in loss_components.items()})
 
     # 2. 会话级任务损失
     valid_session_mask = session_valid.reshape(-1).bool()
@@ -173,6 +177,7 @@ def compute_optimized_loss(
             )
         else:
             s_targets = targets["participant_y"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
+            sess_lc: dict[str, float] = {}
             sess_loss = a2_ordinal_loss(
                 s_logits, s_targets,
                 pos_weight=pos_weight,
@@ -180,6 +185,7 @@ def compute_optimized_loss(
                 use_corn=use_corn_loss,
                 use_qwk=use_qwk_aux,
                 qwk_weight=qwk_weight,
+                loss_components=sess_lc,
             )
 
         # 会话类型分类损失
@@ -195,6 +201,7 @@ def compute_optimized_loss(
     losses.append(type_loss)
     loss_dict["session_loss"] = sess_loss.item()
     loss_dict["session_type_loss"] = type_loss.item()
+    loss_dict.update({f"sess_{k}": v for k, v in sess_lc.items()})
 
     # 3. 辅助任务损失 (仅 emotion_dims 弱正则化)
     if model.enable_auxiliary_tasks:
@@ -253,6 +260,7 @@ def create_optimized_model(
         use_uncertainty_weighting=cfg.get("use_uncertainty_weighting", True),
         enable_auxiliary_tasks=cfg.get("enable_auxiliary_tasks", True),
         enable_emotion_dims=cfg.get("enable_emotion_dims", True),
+        uw_log_var_clamp=cfg.get("uw_log_var_clamp", None),
     )
 
 
