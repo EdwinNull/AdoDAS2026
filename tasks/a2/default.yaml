@@ -40,7 +40,7 @@ batch_size: 64
 lr: 0.001
 weight_decay: 0.01
 warmup_epochs: 3
-epochs: 40
+epochs: 25
 seed: 325799
 num_workers: 8
 preload_workers: 16
@@ -49,7 +49,7 @@ preload: true
 use_hdf5: false
 grad_clip: 1.0
 use_pos_weight: true
-patience: 10
+patience: 6
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
 submission_level: participant
@@ -57,7 +57,8 @@ decode_method: auto
 label_smoothing: 0.05
 feature_noise_std: 0.01
 session_drop_prob: 0.1
-early_stop_metric: val_loss
+early_stop_metric: primary
+early_stop_min_delta: 0.005
 
 use_corn_loss: 1
 use_qwk_aux: 1
