@@ -455,6 +455,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--checkpoint", default="best.pt",
+                   help="Checkpoint file name under run-dir/checkpoints/ (default: best.pt)")
     p.add_argument("--template-csv", type=Path, default=TEMPLATE_CSV,
                    help="CSV with the canonical row order / columns to match")
     return p.parse_args()
@@ -496,7 +498,7 @@ def main() -> int:
     log.info(f"Output csv: {args.output}")
 
     meta_path = run_dir / "run_meta.json"
-    ckpt_path = run_dir / "checkpoints" / "best.pt"
+    ckpt_path = run_dir / "checkpoints" / args.checkpoint
     cfg_path = run_dir / "config_used.yaml"
     for p in (meta_path, ckpt_path):
         if not p.exists():

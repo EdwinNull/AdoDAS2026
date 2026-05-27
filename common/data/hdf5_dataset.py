@@ -29,6 +29,7 @@ class HDF5GroupedDataset(Dataset):
         hdf5_path: str | Path,
         session_drop_prob: float = 0.0,
         preload: bool = False,
+        valid_pids: set[str] | None = None,
     ):
         self.hdf5_path = Path(hdf5_path)
         self.session_drop_prob = float(session_drop_prob)
@@ -39,6 +40,19 @@ class HDF5GroupedDataset(Dataset):
         with h5py.File(self.hdf5_path, 'r') as f:
             self.n_participants = f.attrs['n_participants']
             self.split = f.attrs.get('split', 'unknown')
+
+        # 构建 PID -> 原始索引 映射，支持 valid_pids 过滤
+        self._idx_map: list[int] = []  # 逻辑索引 -> HDF5 原始索引
+        if valid_pids is not None:
+            with h5py.File(self.hdf5_path, 'r') as f:
+                for i in range(self.n_participants):
+                    grp = f.get(f"p_{i:05d}")
+                    if grp is not None and grp.attrs.get('anon_pid', '') in valid_pids:
+                        self._idx_map.append(i)
+            self.n_participants = len(self._idx_map)
+            log.info(f"Filtered HDF5 to {self.n_participants} participants (valid_pids={len(valid_pids)})")
+        else:
+            self._idx_map = list(range(self.n_participants))
 
         log.info(f"Loaded HDF5 dataset: {self.hdf5_path}")
         log.info(f"  Participants: {self.n_participants}")
@@ -60,7 +74,8 @@ class HDF5GroupedDataset(Dataset):
 
         with h5py.File(self.hdf5_path, 'r') as f:
             for i in tqdm(range(self.n_participants), desc="Preload HDF5", dynamic_ncols=True):
-                self._cache[i] = self._load_participant_from_h5(f, i)
+                raw_idx = self._idx_map[i]
+                self._cache[i] = self._load_participant_from_h5(f, raw_idx)
 
         gb = self._estimate_cache_bytes() / 1024**3
         log.info(f"Preloaded {self.n_participants} participants ({gb:.1f} GB in RAM)")
@@ -152,13 +167,14 @@ class HDF5GroupedDataset(Dataset):
         return self.n_participants
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        raw_idx = self._idx_map[idx]
         # 如果已preload，直接从缓存读取
         if self._cache is not None:
             sample = self._cache[idx]
         else:
             # 按需从HDF5读取
             with h5py.File(self.hdf5_path, 'r') as f:
-                sample = self._load_participant_from_h5(f, idx)
+                sample = self._load_participant_from_h5(f, raw_idx)
 
         # 训练时应用session dropout
         if self.split == "train" and self.session_drop_prob > 0.0:
@@ -200,10 +216,11 @@ class HDF5GroupedDataset(Dataset):
     def _probe_dims(self) -> dict[str, int]:
         """从第一个样本探测特征维度"""
         dims: dict[str, int] = {}
+        first_raw_idx = self._idx_map[0]
 
         with h5py.File(self.hdf5_path, 'r') as f:
             # 找到第一个有效的session
-            first_grp = f["p_00000"]
+            first_grp = f[f"p_{first_raw_idx:05d}"]
             for sess_idx in range(4):
                 sess_key = f"s{sess_idx}"
                 if sess_key in first_grp:

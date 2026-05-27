@@ -20,5 +20,8 @@ Thumbs.db
 
 # Project artifacts
 *.log
+output/
 runs/
 checkpoints/
+result*.csv
+*.pt

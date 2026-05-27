@@ -36,6 +36,7 @@ class OptimizedGroupedModel(nn.Module):
         enable_auxiliary_tasks: bool = True,
         enable_emotion_dims: bool = True,
         uw_log_var_clamp: float | None = None,
+        task_log_var_bounds: list[tuple[float | None, float | None]] | None = None,
     ):
         super().__init__()
         self.grouped_model = grouped_model
@@ -57,7 +58,11 @@ class OptimizedGroupedModel(nn.Module):
             n_tasks = 3  # 主任务、会话任务、会话类型
             if enable_auxiliary_tasks and enable_emotion_dims:
                 n_tasks += 1
-            self.uncertainty_loss = UncertaintyWeightedLoss(n_tasks=n_tasks, log_var_clamp=uw_log_var_clamp)
+            self.uncertainty_loss = UncertaintyWeightedLoss(
+                n_tasks=n_tasks,
+                log_var_clamp=uw_log_var_clamp,
+                task_log_var_bounds=task_log_var_bounds,
+            )
 
     def forward(
         self,
@@ -261,6 +266,7 @@ def create_optimized_model(
         enable_auxiliary_tasks=cfg.get("enable_auxiliary_tasks", True),
         enable_emotion_dims=cfg.get("enable_emotion_dims", True),
         uw_log_var_clamp=cfg.get("uw_log_var_clamp", None),
+        task_log_var_bounds=cfg.get("uw_task_log_var_bounds", None),
     )
 
 

@@ -39,7 +39,7 @@ batch_size: 64
 lr: 0.001
 weight_decay: 0.01
 warmup_epochs: 1
-epochs: 30
+epochs: 25
 seed: 42
 num_workers: 8
 amp: true
@@ -48,7 +48,7 @@ grad_clip: 1.0
 use_pos_weight: true
 patience: 6
 session_loss_weight: 0.2
-session_type_loss_weight: 0.15
+session_type_loss_weight: 0.1
 submission_level: participant
 decode_method: auto
 label_smoothing: 0.0

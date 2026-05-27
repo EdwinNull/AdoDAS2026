@@ -70,11 +70,11 @@ python train.py --task a1 --config tasks/a1/default.yaml
 ### 推理
 
 ```bash
-# 测试集推理
-python infer.py --task a2 --checkpoint <path_to_best.pt> --split test_hidden
+# A2 测试集推理
+python scripts/run_predict_a2.py --run-dir output/runs/<run_name>
 
-# 指定输出
-python infer.py --task a2 --checkpoint <path_to_best.pt> --output predictions.csv
+# 或直接指定 checkpoint
+python scripts/run_predict_a2.py --checkpoint <path_to_best.pt>
 ```
 
 ### HDF5 打包（加速数据加载）
@@ -273,7 +273,7 @@ Encoded via `AuxiliaryAttributeEncoder` with embedding layers, concatenated to p
 - **LUPI disabled by default**: `aux_lupi.enabled: false` in default.yaml. Must explicitly enable via YAML or CLI `--aux_lupi_enabled 1`.
 - **LUPI aux heads requires aux_attrs in batch**: `aux_favoritism` has ~35% structural missing (only-child → no favoritism). Loss masking handles this via `valid_mask = targets >= 0`.
 - **Sample reweight non-MTL vs MTL**: Sample reweight adds a weighted BCE term (coefficient 0.3) — it does NOT replace the main loss. Enhanced losses (ASL, CORN, QWK) are preserved.
-- **Checkpoint compatibility**: `infer.py` loads with `strict=False` to tolerate missing/extra aux_heads keys.
+- **Checkpoint compatibility**: `scripts/run_predict_a2.py` loads with `strict=False` to tolerate missing/extra aux_heads keys.
 
 ### LUPI Implementation (Learning Using Privileged Information)
 

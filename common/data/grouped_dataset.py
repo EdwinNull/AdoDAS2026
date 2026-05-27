@@ -36,6 +36,7 @@ class GroupedParticipantDataset(Dataset):
         split: str,
         session_drop_prob: float = 0.0,
         max_participants: int = 0,
+        valid_pids: set[str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.split = split
@@ -50,6 +51,10 @@ class GroupedParticipantDataset(Dataset):
 
         self.participants: list[dict[str, Any]] = []
         for (school, cls, pid), group in grouped:
+            # 如果指定了 valid_pids，只加载指定 PID 的参与者
+            if valid_pids is not None and str(pid) not in valid_pids:
+                continue
+
             # 构建会话字典：{"A01": row1, "B01": row2, ...}
             sess_rows = {}
             for _, row in group.iterrows():

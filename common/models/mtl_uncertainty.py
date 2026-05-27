@@ -32,13 +32,34 @@ class UncertaintyWeightedLoss(nn.Module):
     参数:
         n_tasks: 任务数量
         init_log_var: 初始 log(σ²) 值（默认0，即 σ²=1）
+        log_var_clamp: 统一的对称钳制值（向后兼容）
+        task_log_var_bounds: 逐任务钳制 [(min, max), ...] — 每个元素为 (float|None, float|None)
+            - task 0 (主任务): max 钳制防止 weight 过低 (如 max=0.0 保证 precision ≥ 1.0)
+            - task 1+ (辅助任务): min 钳制防止 weight 过高 (如 min=-0.5 保证 precision ≤ 1.65)
+
+            None 表示该方向不钳制。与 log_var_clamp 同时使用时，逐任务钳制优先级更高。
     """
-    def __init__(self, n_tasks: int, init_log_var: float = 0.0, log_var_clamp: float | None = None):
+    def __init__(self, n_tasks: int, init_log_var: float = 0.0,
+                 log_var_clamp: float | None = None,
+                 task_log_var_bounds: list[tuple[float | None, float | None]] | None = None):
         super().__init__()
         self.n_tasks = n_tasks
         self.log_var_clamp = log_var_clamp
+        self.task_log_var_bounds = task_log_var_bounds
         # 可学习参数：log(σ²)，用 log 保证 σ² > 0
         self.log_vars = nn.Parameter(torch.full((n_tasks,), init_log_var, dtype=torch.float32))
+
+    def _clamp_log_var(self, log_var: torch.Tensor, task_idx: int) -> torch.Tensor:
+        """对指定任务的 log_var 应用逐任务钳制"""
+        if self.task_log_var_bounds is not None and task_idx < len(self.task_log_var_bounds):
+            lo, hi = self.task_log_var_bounds[task_idx]
+            if lo is not None:
+                log_var = torch.clamp(log_var, min=lo)
+            if hi is not None:
+                log_var = torch.clamp(log_var, max=hi)
+        elif self.log_var_clamp is not None:
+            log_var = torch.clamp(log_var, -self.log_var_clamp, self.log_var_clamp)
+        return log_var
 
     def forward(self, losses: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
         """
@@ -56,9 +77,7 @@ class UncertaintyWeightedLoss(nn.Module):
         weights = {}
 
         for i, loss in enumerate(losses):
-            log_var = self.log_vars[i]
-            if self.log_var_clamp is not None:
-                log_var = torch.clamp(log_var, -self.log_var_clamp, self.log_var_clamp)
+            log_var = self._clamp_log_var(self.log_vars[i], i)
             # 不确定性加权公式：(1 / 2σ²) × L + log(σ)
             # = (1 / 2exp(log_var)) × L + 0.5 × log_var
             precision = torch.exp(-log_var)  # 1/σ²
@@ -68,6 +87,8 @@ class UncertaintyWeightedLoss(nn.Module):
             # 记录有效权重（用于监控）
             weights[f"task_{i}_weight"] = precision.item()
             weights[f"task_{i}_sigma"] = torch.exp(0.5 * log_var).item()
+            # 同时记录实际 log_var 值，方便调试
+            weights[f"task_{i}_log_var"] = log_var.item()
 
         return total_loss, weights
 

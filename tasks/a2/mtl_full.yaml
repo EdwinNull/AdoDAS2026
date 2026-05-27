@@ -73,13 +73,21 @@ qwk_weight: 0.3                   # QWK 损失权重
 # emotion_dims (valence/arousal) 由 DASS-21 推导，保留为弱正则化项 (weight ≤ 0.05)
 # emotion_cls 和 AU 预测已删除：前者与主标签同源无新增信号，后者为占位实现
 use_uncertainty_weighting: true
-uw_log_var_clamp: 1.0              # 钳制 log_var 范围，防止辅助任务权重膨胀 (precision ∈ [0.37, 2.72])
+uw_log_var_clamp: 1.0              # 统一钳制（向后兼容，task_log_var_bounds 优先）
 enable_auxiliary_tasks: true
 enable_emotion_dims: true
+# 逐任务 log_var 钳制（S1.2 per-task sigma 约束）
+# task 0 (主任务): max=0.0 → precision≥1.0, 权重不退化
+# task 1-3 (辅助任务): min=-0.5 → precision≤1.65, 权重不膨胀
+uw_task_log_var_bounds:
+  - [null, 0.0]
+  - [-0.5, null]
+  - [-0.5, null]
+  - [-0.5, null]
 
 # 固定任务权重（仅在 use_uncertainty_weighting=false 时生效）
 session_loss_weight: 0.25
-session_type_loss_weight: 0.08
+session_type_loss_weight: 0.05
 emotion_dims_weight: 0.05
 
 # ============================================================
@@ -98,7 +106,7 @@ preload: true
 use_hdf5: false
 grad_clip: 1.0
 use_pos_weight: true
-patience: 5
+patience: 6
 early_stop_metric: primary          # 按 QWK 早停，避免错过峰值
 early_stop_min_delta: 0.005         # QWK 噪声水平约 0.005，低于此的波动不重置计数器
 

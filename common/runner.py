@@ -417,6 +417,9 @@ def train_one_epoch_grouped(
     session_head.train()
     total_loss = 0.0
     n_batches = 0
+    # S1.5: 累积 QWK aux loss 用于日志
+    accum_qwk_aux_loss = 0.0
+    n_qwk_batches = 0
 
     desc = f"Train {epoch}/{epochs}"
     if best_metric >= 0:
@@ -478,6 +481,7 @@ def train_one_epoch_grouped(
                     ).mean(dim=-1)
                     rew_loss_a1 = (per_sample * sample_w).mean()
             else:
+                loss_components: dict = {}
                 main_loss = a2_ordinal_loss(
                     p_logits, targets,
                     pos_weight=pos_weight,
@@ -485,7 +489,11 @@ def train_one_epoch_grouped(
                     use_corn=use_corn_loss,
                     use_qwk=use_qwk_aux,
                     qwk_weight=qwk_weight,
+                    loss_components=loss_components,
                 )
+                if "qwk_loss" in loss_components:
+                    accum_qwk_aux_loss += loss_components["qwk_loss"]
+                    n_qwk_batches += 1
                 rew_loss_a2 = p_logits.new_zeros(())
                 if lupi_reweight:
                     sample_w = _compute_aux_consistency_weight(
@@ -521,7 +529,10 @@ def train_one_epoch_grouped(
                         use_corn=use_corn_loss,
                         use_qwk=use_qwk_aux,
                         qwk_weight=qwk_weight,
+                        loss_components=loss_components,
                     )
+                    if "qwk_loss" in loss_components:
+                        accum_qwk_aux_loss += loss_components["qwk_loss"]
 
                 type_loss = F.cross_entropy(
                     out["session_type_logits"][valid_session_mask],
@@ -565,6 +576,10 @@ def train_one_epoch_grouped(
         pbar.set_postfix_str(f"{loss.item():.4f}")
 
     pbar.close()
+    # S1.5: 输出 QWK aux loss 分量
+    if n_qwk_batches > 0:
+        avg_qwk_aux = accum_qwk_aux_loss / n_qwk_batches
+        log.info(f"  [QWK aux] avg_qwk_aux_loss={avg_qwk_aux:.6f} (qwk_weight={qwk_weight})")
     return total_loss / max(n_batches, 1)
 
 
@@ -1195,6 +1210,21 @@ def main() -> None:
 
     meta = RunMetadata(run_dirs["root"], cfg, task, run_name)
 
+    # Stage 0: 加载 val 二次切分配置（如果存在）
+    val_split = None
+    val_split_path = Path("splits/val_split_v1.json")
+    if val_split_path.exists():
+        with open(val_split_path) as f:
+            val_split = json.load(f)
+        log.info(f"Loaded val split v{val_split['version']}: "
+                 f"val_select={val_split['counts']['val_select']}, "
+                 f"val_holdout={val_split['counts']['val_holdout']}, "
+                 f"hash={val_split.get('content_hash', 'N/A')}")
+        meta.set_extra("val_split_version", val_split["version"])
+        meta.set_extra("val_split_hash", val_split.get("content_hash", "N/A"))
+    else:
+        log.info("No val split file found (splits/val_split_v1.json), using entire val set for all purposes")
+
     _defaults = FeatureConfig()
     feat_cfg = FeatureConfig(
         feature_root=cfg.get("feature_root", _defaults.feature_root),
@@ -1211,6 +1241,14 @@ def main() -> None:
     # 选择使用HDF5或原始数据集
     use_hdf5 = bool(cfg.get("use_hdf5", False))
     max_pts = cfg.get("max_participants", 0) or 0
+
+    # Stage 0: 准备 val 切分的 PID 集合
+    val_select_pids: set[str] | None = None
+    val_holdout_pids: set[str] | None = None
+    use_val_split = val_split is not None
+    if use_val_split:
+        val_select_pids = set(val_split["val_select_pids"])
+        val_holdout_pids = set(val_split["val_holdout_pids"])
 
     if use_hdf5:
         log.info("Using HDF5 packed datasets")
@@ -1232,11 +1270,28 @@ def main() -> None:
             session_drop_prob=cfg.get("session_drop_prob", 0.1),
             preload=preload,
         )
-        val_ds = HDF5GroupedDataset(
-            hdf5_path=val_hdf5,
-            session_drop_prob=0.0,
-            preload=preload,
-        )
+        if use_val_split:
+            val_select_ds = HDF5GroupedDataset(
+                hdf5_path=val_hdf5,
+                session_drop_prob=0.0,
+                preload=preload,
+                valid_pids=val_select_pids,
+            )
+            val_holdout_ds = HDF5GroupedDataset(
+                hdf5_path=val_hdf5,
+                session_drop_prob=0.0,
+                preload=preload,
+                valid_pids=val_holdout_pids,
+            )
+            val_ds = None
+        else:
+            val_ds = HDF5GroupedDataset(
+                hdf5_path=val_hdf5,
+                session_drop_prob=0.0,
+                preload=preload,
+            )
+            val_select_ds = val_ds
+            val_holdout_ds = None
     else:
         log.info("Using original scattered datasets")
         train_ds = GroupedParticipantDataset(
@@ -1244,12 +1299,33 @@ def main() -> None:
             session_drop_prob=cfg.get("session_drop_prob", 0.1),
             max_participants=max_pts,
         )
-        val_ds = GroupedParticipantDataset(manifest_dir / "Val" / "val.csv", feat_cfg, split="val",
-                                          max_participants=max_pts)
+        if use_val_split:
+            val_select_ds = GroupedParticipantDataset(
+                manifest_dir / "Val" / "val.csv", feat_cfg, split="val",
+                max_participants=max_pts,
+                valid_pids=val_select_pids,
+            )
+            val_holdout_ds = GroupedParticipantDataset(
+                manifest_dir / "Val" / "val.csv", feat_cfg, split="val",
+                max_participants=max_pts,
+                valid_pids=val_holdout_pids,
+            )
+            val_ds = None
+        else:
+            val_ds = GroupedParticipantDataset(
+                manifest_dir / "Val" / "val.csv", feat_cfg, split="val",
+                max_participants=max_pts,
+            )
+            val_select_ds = val_ds
+            val_holdout_ds = None
 
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
-    log.info(f"Train: {len(train_ds)} participants, Val: {len(val_ds)} participants")
+    if use_val_split:
+        log.info(f"Train: {len(train_ds)} participants, "
+                 f"Val_select: {len(val_select_ds)}, Val_holdout: {len(val_holdout_ds)}")
+    else:
+        log.info(f"Train: {len(train_ds)} participants, Val: {len(val_select_ds)} participants")
 
     # 如果使用原始数据集且需要preload
     if not use_hdf5:
@@ -1259,9 +1335,15 @@ def main() -> None:
             t_pre = time.time()
             preload_workers = cfg.get("preload_workers", num_workers)
             train_gb = train_ds.preload(desc="Preload train", num_workers=preload_workers)
-            val_gb = val_ds.preload(desc="Preload val", num_workers=preload_workers)
-            log.info(f"Preload done: {train_gb:.1f}G + {val_gb:.1f}G = {train_gb + val_gb:.1f}G, "
-                     f"took {_fmt_duration(time.time() - t_pre)}")
+            if use_val_split:
+                sel_gb = val_select_ds.preload(desc="Preload val_select", num_workers=preload_workers)
+                hout_gb = val_holdout_ds.preload(desc="Preload val_holdout", num_workers=preload_workers)
+                log.info(f"Preload done: {train_gb:.1f}G + {sel_gb:.1f}G (select) + {hout_gb:.1f}G (holdout) = "
+                         f"{train_gb + sel_gb + hout_gb:.1f}G, took {_fmt_duration(time.time() - t_pre)}")
+            else:
+                val_gb = val_select_ds.preload(desc="Preload val", num_workers=preload_workers)
+                log.info(f"Preload done: {train_gb:.1f}G + {val_gb:.1f}G = {train_gb + val_gb:.1f}G, "
+                         f"took {_fmt_duration(time.time() - t_pre)}")
             num_workers = 0
 
     log.info(f"batch_size={batch_size}, num_workers={num_workers}")
@@ -1272,12 +1354,20 @@ def main() -> None:
         pin_memory=True, drop_last=True,
         persistent_workers=num_workers > 0,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
+    val_select_loader = DataLoader(
+        val_select_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, collate_fn=grouped_collate_fn,
         pin_memory=True,
         persistent_workers=num_workers > 0,
     )
+    val_holdout_loader = DataLoader(
+        val_holdout_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=grouped_collate_fn,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+    ) if val_holdout_ds is not None else None
+    # 向后兼容：保留 val_loader 引用
+    val_loader = val_select_loader
 
     dims = train_ds.feature_dims
     audio_group_dims = {n: dims[n] for n in feat_cfg.audio_sequence_features if n in dims}
@@ -1460,12 +1550,18 @@ def main() -> None:
     metric_name = "F1" if task == "a1" else "QWK"
     t_start = time.time()
 
-    log.info("=" * 90)
+    log.info("=" * 110)
     if task == "a1":
-        log.info("  Epoch  |    LR     | Train Loss | Val Loss | F1 raw | F1 sel |  AUROC | F1[D/A/S]       | Time")
+        if val_holdout_loader is not None:
+            log.info("  Epoch  |    LR     | Train Loss | Val Loss | F1_sel | F1_hout |  AUROC | F1[D/A/S]       | Time")
+        else:
+            log.info("  Epoch  |    LR     | Train Loss | Val Loss | F1 raw | F1 sel |  AUROC | F1[D/A/S]       | Time")
     else:
-        log.info("  Epoch  |    LR     | Train Loss | Val Loss | mean QWK | mean MAE | Time")
-    log.info("=" * 90)
+        if val_holdout_loader is not None:
+            log.info("  Epoch  |    LR     | Train Loss | Val Loss | Q_sel | Q_hout | MAE_sel | MAE_hout | Time")
+        else:
+            log.info("  Epoch  |    LR     | Train Loss | Val Loss | mean QWK | mean MAE | Time")
+    log.info("=" * 110)
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -1523,11 +1619,19 @@ def main() -> None:
             )
 
         # 验证（MTL和标准模式都使用相同的验证函数）
+        # Stage 0: 在 val_select 上验证（用于决策），在 val_holdout 上验证（仅观察）
         val_metrics = validate_grouped(
-            grouped_model, participant_head, session_head, val_loader, device,
+            grouped_model, participant_head, session_head, val_select_loader, device,
             task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
             decode_method=cfg.get("decode_method", "expectation"),
         )
+        val_hout_metrics = None
+        if val_holdout_loader is not None:
+            val_hout_metrics = validate_grouped(
+                grouped_model, participant_head, session_head, val_holdout_loader, device,
+                task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
+                decode_method=cfg.get("decode_method", "expectation"),
+            )
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -1536,6 +1640,7 @@ def main() -> None:
         lr_now = optimizer.param_groups[0]["lr"]
         vram_gb = torch.cuda.max_memory_allocated() / 1024**3
 
+        # 始终使用 val_select 做决策
         primary = val_metrics["primary_metric"]
         is_best = primary > best_metric
         marker = " *" if is_best else ""
@@ -1543,18 +1648,35 @@ def main() -> None:
         if task == "a1":
             pcf1 = val_metrics.get("pcf1", [0, 0, 0])
             selected_f1 = val_metrics["primary_metric"]
-            log.info(
-                f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
-                f"{val_metrics['mean_f1']:.4f} | {selected_f1:.4f} | {val_metrics['auroc']:.4f} | "
-                f"{pcf1[0]:.3f}/{pcf1[1]:.3f}/{pcf1[2]:.3f} | "
-                f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
-            )
+            if val_hout_metrics is not None:
+                log.info(
+                    f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
+                    f"F1_sel={selected_f1:.4f} | F1_hout={val_hout_metrics['primary_metric']:.4f} | "
+                    f"AUROC={val_metrics['auroc']:.4f} | "
+                    f"{pcf1[0]:.3f}/{pcf1[1]:.3f}/{pcf1[2]:.3f} | "
+                    f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
+                )
+            else:
+                log.info(
+                    f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
+                    f"{val_metrics['mean_f1']:.4f} | {selected_f1:.4f} | {val_metrics['auroc']:.4f} | "
+                    f"{pcf1[0]:.3f}/{pcf1[1]:.3f}/{pcf1[2]:.3f} | "
+                    f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
+                )
         else:
-            log.info(
-                f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
-                f" {val_metrics['mean_qwk']:.4f}  |  {val_metrics['mean_mae']:.4f}  | "
-                f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
-            )
+            if val_hout_metrics is not None:
+                log.info(
+                    f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
+                    f"Q_sel={val_metrics['mean_qwk']:.4f} | Q_hout={val_hout_metrics['mean_qwk']:.4f} | "
+                    f"MAE_sel={val_metrics['mean_mae']:.4f} | MAE_hout={val_hout_metrics['mean_mae']:.4f} | "
+                    f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
+                )
+            else:
+                log.info(
+                    f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
+                    f" {val_metrics['mean_qwk']:.4f}  |  {val_metrics['mean_mae']:.4f}  | "
+                    f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
+                )
 
         if is_best:
             best_metric = primary
@@ -1578,6 +1700,25 @@ def main() -> None:
             log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
             meta.update_best(epoch, val_metrics)
 
+        # 每轮保存 last.pt（覆盖），确保可访问最新 epoch 参数
+        if enable_mtl:
+            save_checkpoint(
+                run_dirs["checkpoints"] / "last.pt",
+                optimized_model, optimizer, epoch, primary,
+                extra={"enable_mtl": True},
+            )
+        else:
+            save_checkpoint(
+                run_dirs["checkpoints"] / "last.pt",
+                grouped_model, optimizer, epoch, primary,
+                extra={
+                    "participant_head_state_dict": participant_head.state_dict(),
+                    "session_head_state_dict": session_head.state_dict(),
+                    "enable_mtl": False,
+                },
+            )
+
+        # 始终在 val_select 上判断早停
         es_value = val_metrics["loss"] if early_stop_metric == "val_loss" else primary
         if early_stop.step(es_value):
             log.info(f"  EarlyStopping triggered at epoch {epoch} (patience={patience}, metric={early_stop_metric})")
@@ -1613,9 +1754,10 @@ def main() -> None:
     selected_decode_method = decode_method
 
     if task == "a1":
-        log.info("Calibrating per-task bias offsets on val ...")
+        cal_source = "val_select" if val_holdout_loader is not None else "val"
+        log.info(f"Calibrating per-task bias offsets on {cal_source} ...")
         val_logits, val_labels = collect_val_logits_grouped_a1(
-            grouped_model, participant_head, session_head, val_loader, device, use_amp,
+            grouped_model, participant_head, session_head, val_select_loader, device, use_amp,
             submission_level=submission_level,
         )
         biases, cal_f1s = calibrate_a1_bias(val_logits, val_labels)
@@ -1625,27 +1767,51 @@ def main() -> None:
         best_raw_f1 = float(meta.meta.get("best_metrics", {}).get("mean_f1", best_metric))
         best_selected_f1 = float(meta.meta.get("best_metrics", {}).get("primary_metric", best_metric))
         log.info(
-            f"  Mean calibrated F1: {cal_mean_f1:.4f} "
+            f"  Mean calibrated F1 ({cal_source}): {cal_mean_f1:.4f} "
             f"(vs selected best: {best_selected_f1:.4f}, raw best: {best_raw_f1:.4f})"
         )
         a1_biases = biases
         final_a1_metric = max(best_raw_f1, cal_mean_f1)
         final_a1_strategy = "bias_calibrated" if cal_mean_f1 >= best_raw_f1 else "raw"
+
+        # Stage 0: 在 val_holdout 上评估诚实指标
+        val_hout_cal_f1 = None
+        if val_holdout_loader is not None:
+            hout_logits, hout_labels = collect_val_logits_grouped_a1(
+                grouped_model, participant_head, session_head, val_holdout_loader, device, use_amp,
+                submission_level=submission_level,
+            )
+            # 应用 val_select 上拟合的偏置
+            biased_logits = hout_logits + biases.reshape(1, -1)
+            probs = 1.0 / (1.0 + np.exp(-biased_logits.astype(np.float64)))
+            hout_preds = (probs > 0.5).astype(int)
+            val_hout_cal_f1 = binary_f1(hout_preds, hout_labels)
+            hout_raw_f1 = binary_f1(
+                (1.0 / (1.0 + np.exp(-hout_logits.astype(np.float64))) > 0.5).astype(int),
+                hout_labels,
+            )
+            log.info(f"  [Honest] val_holdout: raw F1={hout_raw_f1:.4f}, calibrated F1={val_hout_cal_f1:.4f}")
+            meta.set_extra("val_holdout_f1_raw", float(hout_raw_f1))
+            meta.set_extra("val_holdout_f1_calibrated", float(val_hout_cal_f1))
+
         meta.set_extra("final_selected_strategy", final_a1_strategy)
         meta.set_extra("final_selected_metrics", {
             "mean_f1": final_a1_metric,
             "mean_f1_raw": best_raw_f1,
             "mean_f1_calibrated": cal_mean_f1,
+            "val_holdout_f1_calibrated": float(val_hout_cal_f1) if val_hout_cal_f1 is not None else None,
             "auroc": meta.meta.get("best_metrics", {}).get("auroc"),
         })
 
-        cal_data = {"biases": biases.tolist(), "cal_f1": cal_f1s, "mean_cal_f1": cal_mean_f1}
+        cal_data = {"biases": biases.tolist(), "cal_f1": cal_f1s, "mean_cal_f1": cal_mean_f1,
+                     "val_holdout_cal_f1": float(val_hout_cal_f1) if val_hout_cal_f1 is not None else None}
         with open(run_dirs["calibration"] / "a1_bias_grouped.json", "w") as f:
             json.dump(cal_data, f, indent=2)
     else:
-        log.info("Calibrating and selecting A2 decode strategy on val ...")
+        cal_source = "val_select" if val_holdout_loader is not None else "val"
+        log.info(f"Calibrating and selecting A2 decode strategy on {cal_source} ...")
         val_logits, val_labels = collect_val_logits_grouped_a2(
-            grouped_model, participant_head, session_head, val_loader, device, use_amp,
+            grouped_model, participant_head, session_head, val_select_loader, device, use_amp,
             submission_level=submission_level,
         )
         val_labels_int = val_labels.astype(int)
@@ -1683,7 +1849,7 @@ def main() -> None:
         selected_decode_method = str(best_result["decode_method"])
         a2_offsets = best_result.get("offsets")
 
-        log.info("  A2 decode comparison on val:")
+        log.info(f"  A2 decode comparison on {cal_source}:")
         for name in ("argmax", "monotonic", "expectation", "calibrated_argmax", "calibrated_monotonic", "calibrated_expectation"):
             result = strategy_results[name]
             preds = result["preds"]
@@ -1695,15 +1861,55 @@ def main() -> None:
             )
 
         log.info(
-            f"  Selected A2 strategy: {best_strategy} "
+            f"  Selected A2 strategy ({cal_source}): {best_strategy} "
             f"(decode={selected_decode_method}, QWK={float(best_result['qwk']):.4f}, MAE={float(best_result['mae']):.4f})"
         )
 
+        # Stage 0: 在 val_holdout 上评估诚实 QWK
+        val_hout_qwk_raw = None
+        val_hout_qwk_cal = None
+        val_hout_mae_cal = None
+        if val_holdout_loader is not None:
+            hout_logits, hout_labels = collect_val_logits_grouped_a2(
+                grouped_model, participant_head, session_head, val_holdout_loader, device, use_amp,
+                submission_level=submission_level,
+            )
+            hout_labels_int = hout_labels.astype(int)
+            # 使用 val_select 上选定的最佳策略评估 val_holdout
+            hout_preds_cal = _decode_a2_logits(
+                decode_head,
+                torch.from_numpy(hout_logits).float() + (torch.as_tensor(a2_offsets, dtype=torch.float32) if a2_offsets is not None else 0.0),
+                decode_method=selected_decode_method,
+            ).cpu().numpy()
+            hout_preds_raw = _decode_a2_logits(
+                decode_head,
+                torch.from_numpy(hout_logits).float(),
+                decode_method=selected_decode_method,
+            ).cpu().numpy()
+            val_hout_qwk_raw = mean_qwk(hout_preds_raw, hout_labels_int)
+            val_hout_qwk_cal = mean_qwk(hout_preds_cal, hout_labels_int)
+            val_hout_mae_cal = mean_mae(hout_preds_cal, hout_labels_int)
+            log.info(
+                f"  [Honest] val_holdout: raw QWK={val_hout_qwk_raw:.4f}, "
+                f"calibrated QWK={val_hout_qwk_cal:.4f}, MAE={val_hout_mae_cal:.4f}"
+            )
+            # 输出分布健康度
+            hout_total = hout_preds_cal.size
+            hout_dist = [np.sum(hout_preds_cal == v) / hout_total * 100 for v in range(4)]
+            log.info(
+                f"  [Honest] val_holdout distribution: "
+                f"0={hout_dist[0]:.1f}% 1={hout_dist[1]:.1f}% 2={hout_dist[2]:.1f}% 3={hout_dist[3]:.1f}%"
+            )
+
         meta.set_extra("final_selected_strategy", best_strategy)
         meta.set_extra("final_selected_metrics", {
-            "mean_qwk": float(best_result["qwk"]),
-            "mean_mae": float(best_result["mae"]),
+            "val_select_qwk_calibrated": float(best_result["qwk"]),
+            "val_select_mae": float(best_result["mae"]),
+            "val_holdout_qwk_raw": float(val_hout_qwk_raw) if val_hout_qwk_raw is not None else None,
+            "val_holdout_qwk_calibrated": float(val_hout_qwk_cal) if val_hout_qwk_cal is not None else None,
+            "val_holdout_mae_calibrated": float(val_hout_mae_cal) if val_hout_mae_cal is not None else None,
             "decode_method": selected_decode_method,
+            "calibration_source": cal_source,
         })
 
         cal_data = {
@@ -1711,6 +1917,10 @@ def main() -> None:
             "selected_decode_method": selected_decode_method,
             "selected_qwk": float(best_result["qwk"]),
             "selected_mae": float(best_result["mae"]),
+            "calibration_source": cal_source,
+            "val_holdout_qwk_raw": float(val_hout_qwk_raw) if val_hout_qwk_raw is not None else None,
+            "val_holdout_qwk_calibrated": float(val_hout_qwk_cal) if val_hout_qwk_cal is not None else None,
+            "val_holdout_mae_calibrated": float(val_hout_mae_cal) if val_hout_mae_cal is not None else None,
             "strategies": {
                 name: {
                     "decode_method": str(result["decode_method"]),
