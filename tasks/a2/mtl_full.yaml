@@ -122,7 +122,6 @@ session_drop_prob: 0.1            # 会话级dropout
 # ============================================================
 submission_level: participant
 decode_method: auto
-run_inference_after_train: true
 
 aux_lupi:
   enabled: false                     # 默认关闭，通过 --lupi 独立控制

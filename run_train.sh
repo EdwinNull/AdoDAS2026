@@ -11,6 +11,10 @@ cd "$PROJECT_DIR"
 TASK="a2"
 PRESET="default"
 GPU="0"
+GPU_EXPLICIT=0
+GPU_WAIT=0
+GPU_FREE_GB=28
+GPU_IDLE_DURATION=30
 LUPI=""
 EXTRA_ARGS=()
 
@@ -28,42 +32,45 @@ usage() {
 选项:
   --task a1|a2         任务 (默认: a2)
   --preset name         配置预设:
-                          default   - 基线配置
-                          full      - 全量优化 (MTL + 增强损失, LUPI 默认关闭)
-                          debug     - 快速调试 (小模型, 2 epochs)
+                          default   - 基线配置 (Stage 1: 训练稳定化)
+                          full      - 全量优化 (MTL+增强损失+UW约束+LUPI关闭)
+                          debug     - 快速调试 (100人, 2 epochs)
   --lupi mode           LUPI 模式:
                           heads     - 辅助属性预测头
                           weight    - 样本一致性加权
                           both      - 两者同时启用
   --gpu N               GPU ID (默认: 0)
+  --gpu-wait            等待 GPU 空闲显存 ≥28GB 后自动启动
+  --gpu-free-gb N       所需空闲显存 GB 数 (配合 --gpu-wait, 默认 28)
+  --gpu-idle-duration N 空闲持续时间秒数 (配合 --gpu-wait, 默认 30)
   --name <run_name>     自定义运行名称 (默认: 自动生成)
-  --extra "..."         传递给 train.py 的额外参数 (用于控制数据加载、跨模态注意力等)
+  --extra "..."         传递给 train.py 的额外参数
   -h, --help            显示此帮助
 
 环境变量:
   CUDA_VISIBLE_DEVICES  覆盖 GPU 选择
   ADODAS_DATA_ROOT      数据根目录 (默认: /data1/AdoDas)
-  ADODAS_OUTPUT_ROOT    输出根目录 (默认: /data1/AdoDas/output)
+  ADODAS_OUTPUT_ROOT    输出根目录 (默认: ./output)
 
 示例:
-  ./run_train.sh --task a2 --preset default                   # A2 基线训练
-  ./run_train.sh --task a2 --preset full --gpu 0              # A2 全量优化
-  ./run_train.sh --task a2 --preset default --lupi heads      # A2 + LUPI aux_heads
-  ./run_train.sh --task a2 --preset default --lupi both       # A2 + LUPI 全部
-  ./run_train.sh --task a2 --preset full --lupi weight        # A2 全量 + sample_reweight
-  ./run_train.sh --task a2 --preset debug --gpu 1             # A2 快速调试
+  # 直接启动
+  ./run_train.sh --task a2 --preset default
+
+  # 等待 GPU 空闲 ≥28GB 后自动启动 (推荐, 27GB训练+1GB余量)
+  ./run_train.sh --task a2 --preset full --gpu-wait
+
+  # 等待 GPU 0 空闲 40GB，持续 60s
+  ./run_train.sh --task a2 --preset full --gpu 0 --gpu-wait \
+      --gpu-free-gb 40 --gpu-idle-duration 60
+
+  # A2 + LUPI
+  ./run_train.sh --task a2 --preset default --lupi heads
+  ./run_train.sh --task a2 --preset full --lupi both
 
 数据加载 (通过 --extra 控制):
-  # HDF5 全量预载（推荐：稳定快速）
-  --extra "--use_hdf5 1 --preload 1"
-  # HDF5 按需加载（低内存，mmap 读盘）
-  --extra "--use_hdf5 1 --preload 0"
-  # Raw 文件预载（控制并行数防死锁）
-  --extra "--preload 1 --preload_workers 4"
-
-跨模态注意力 (P1):
-  # 开启
-  --extra "--use_cross_modal 1"
+  --extra "--use_hdf5 1 --preload 1"       # HDF5 全量预载
+  --extra "--use_hdf5 1 --preload 0"       # HDF5 按需加载
+  --extra "--preload 1 --preload_workers 4" # Raw 文件预载
 EOF
     exit 0
 }
@@ -78,7 +85,13 @@ while [[ $# -gt 0 ]]; do
         --lupi)
             LUPI="$2"; shift 2 ;;
         --gpu)
-            GPU="$2"; shift 2 ;;
+            GPU="$2"; GPU_EXPLICIT=1; shift 2 ;;
+        --gpu-wait)
+            GPU_WAIT=1; shift ;;
+        --gpu-free-gb)
+            GPU_FREE_GB="$2"; shift 2 ;;
+        --gpu-idle-duration)
+            GPU_IDLE_DURATION="$2"; shift 2 ;;
         --name)
             EXTRA_ARGS+=("--run_name" "$2"); shift 2 ;;
         --extra)
@@ -176,8 +189,13 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
 fi
 echo "============================================================"
 
+# ---- 构建训练命令 ----
+TRAIN_CMD="python train.py --task $TASK --config $CONFIG --feature_root $DATA_ROOT --manifest_dir $DATA_ROOT --output_dir $OUTPUT_ROOT"
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    TRAIN_CMD="$TRAIN_CMD ${EXTRA_ARGS[*]}"
+fi
+
 # ---- 启动训练 ----
-export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 if command -v conda &>/dev/null; then
@@ -190,14 +208,25 @@ if command -v conda &>/dev/null; then
     fi
 fi
 
-echo "  Running: python train.py --task $TASK --config $CONFIG ${EXTRA_ARGS[*]}"
-echo "============================================================"
-echo ""
-
-exec python train.py \
-    --task "$TASK" \
-    --config "$CONFIG" \
-    --feature_root "$DATA_ROOT" \
-    --manifest_dir "$DATA_ROOT" \
-    --output_dir "$OUTPUT_ROOT" \
-    "${EXTRA_ARGS[@]}"
+if [[ "$GPU_WAIT" -eq 1 ]]; then
+    echo "  Mode: GPU wait (free ≥ ${GPU_FREE_GB}GB, idle ${GPU_IDLE_DURATION}s)"
+    if [[ "$GPU_EXPLICIT" -eq 1 ]]; then
+        GPU_ARGS="--gpu $GPU"
+    else
+        GPU_ARGS=""
+    fi
+    echo "  Running: python scripts/gpu_monitor_train.py $GPU_ARGS --free-gb $GPU_FREE_GB --idle-duration $GPU_IDLE_DURATION --command \"$TRAIN_CMD\""
+    echo "============================================================"
+    echo ""
+    exec python scripts/gpu_monitor_train.py \
+        $GPU_ARGS \
+        --free-gb "$GPU_FREE_GB" \
+        --idle-duration "$GPU_IDLE_DURATION" \
+        --command "$TRAIN_CMD"
+else
+    export CUDA_VISIBLE_DEVICES="$GPU"
+    echo "  Running: $TRAIN_CMD"
+    echo "============================================================"
+    echo ""
+    exec $TRAIN_CMD
+fi

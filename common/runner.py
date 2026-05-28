@@ -1935,7 +1935,16 @@ def main() -> None:
         with open(run_dirs["calibration"] / "a2_threshold_offsets_grouped.json", "w") as f:
             json.dump(cal_data, f, indent=2)
 
-    if bool(cfg.get("run_inference_after_train", False)):
+    # 训后自动推理已禁用 — 统一使用 scripts/run_predict_a2.py 手动推理
+    if False:  # was: bool(cfg.get("run_inference_after_train", False))
+        submit_calibrate = bool(cfg.get("submission_calibrate", False))
+        submit_decode = selected_decode_method if submit_calibrate else "argmax"
+        submit_offsets = a2_offsets if submit_calibrate else None
+        log.info(
+            "Submission decode: %s, calibration: %s",
+            submit_decode, "on" if submit_offsets is not None else "off",
+        )
+
         run_dirs["submissions"].mkdir(parents=True, exist_ok=True)
         _MANIFEST_SPLIT_DIR = {"val": "Val", "test_hidden": "Test"}
         for split_name in ("val", "test_hidden"):
@@ -1958,8 +1967,8 @@ def main() -> None:
                 desc=f"Submit {split_name}",
                 submission_level=submission_level,
                 a1_biases=a1_biases,
-                decode_method=selected_decode_method,
-                a2_threshold_offsets=a2_offsets,
+                decode_method=submit_decode,
+                a2_threshold_offsets=submit_offsets,
             )
 
             manifest_df = pd.read_csv(manifest_path)
@@ -2025,7 +2034,7 @@ def main() -> None:
             sub.to_csv(out_path, index=False)
             log.info(f"Wrote {len(sub)} rows to {out_path}")
     else:
-        log.info("Skipping submission generation after training; use infer.py for release inference.")
+        log.info("Post-train inference disabled; use scripts/run_predict_a2.py for submission generation.")
 
     meta.finish("completed")
     log.info(f"Run complete: {run_name}")

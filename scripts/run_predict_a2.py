@@ -459,6 +459,9 @@ def parse_args() -> argparse.Namespace:
                    help="Checkpoint file name under run-dir/checkpoints/ (default: best.pt)")
     p.add_argument("--template-csv", type=Path, default=TEMPLATE_CSV,
                    help="CSV with the canonical row order / columns to match")
+    p.add_argument("--calibrate", action="store_true",
+                   help="Opt-in: load calibration offsets and use the val-selected decode "
+                        "strategy (default: pure argmax, no calibration)")
     return p.parse_args()
 
 
@@ -527,23 +530,36 @@ def main() -> int:
     # Extract grouped_model.* and participant_head.* from the flat state dict.
     model_sd: dict[str, torch.Tensor] = {}
     head_sd: dict[str, torch.Tensor] = {}
-    for k, v in full_sd.items():
-        if k.startswith("grouped_model."):
-            model_sd[k[len("grouped_model."):]] = v
-        elif k.startswith("participant_head."):
-            head_sd[k[len("participant_head."):]] = v
+
+    # Check for MTL-style prefix (keys like "grouped_model.backbone.tcn...")
+    has_mtl_prefix = any(k.startswith("grouped_model.") for k in full_sd)
+    if has_mtl_prefix:
+        for k, v in full_sd.items():
+            if k.startswith("grouped_model."):
+                model_sd[k[len("grouped_model."):]] = v
+            elif k.startswith("participant_head."):
+                head_sd[k[len("participant_head."):]] = v
+        log.info("MTL checkpoint format detected (grouped_model.* prefix)")
+    else:
+        # Non-MTL checkpoint: model_state_dict IS the grouped_model state_dict
+        model_sd = {k: v for k, v in full_sd.items()}
+        # Participant head is stored separately in ckpt extras
+        if "participant_head_state_dict" in ckpt:
+            head_sd = ckpt["participant_head_state_dict"]
+            log.info("Non-MTL checkpoint format (separate head state dict)")
 
     if not model_sd:
-        log.error("No grouped_model.* keys found in checkpoint")
+        log.error("No model state dict found in checkpoint")
         return 2
     if not head_sd:
-        log.error("No participant_head.* keys found in checkpoint")
+        log.error("No participant head state dict found in checkpoint")
         return 2
 
     log.info(f"Checkpoint epoch={ckpt.get('epoch')} best_metric={ckpt.get('best_metric'):.4f}")
-    log.info(f"Extracted {len(model_sd)} grouped_model keys + {len(head_sd)} participant_head keys")
-    if ckpt.get("enable_mtl"):
-        log.info("MTL checkpoint detected — non-grouped_model keys (aux_task_head, "
+    log.info(f"Extracted {len(model_sd)} model keys + {len(head_sd)} participant_head keys")
+    enable_mtl = ckpt.get("enable_mtl", False)
+    if enable_mtl:
+        log.info("MTL checkpoint — non-grouped_model keys (aux_task_head, "
                  "session_head, etc.) are skipped at load time")
 
     grouped_model, participant_head, feat_cfg, audio_group_dims, video_group_dims = build_model_from_config(cfg, model_sd)
@@ -602,7 +618,16 @@ def main() -> int:
         pin_memory=(device.type == "cuda"),
     )
 
-    decode_method, offsets = load_calibration(run_dir)
+    # ---- calibration & decode ----
+    if args.calibrate:
+        decode_method, offsets = load_calibration(run_dir)
+        log.info("calibration applied: %s, decode: %s",
+                 offsets is not None, decode_method)
+    else:
+        decode_method = "argmax"
+        offsets = None
+        log.info("calibration applied: False, decode: argmax")
+    log.info("checkpoint: %s", ckpt_path)
 
     log.info(f"Running inference: {len(dataset)} participants, "
              f"batch_size={args.batch_size}, workers={args.num_workers} ...")
@@ -611,6 +636,15 @@ def main() -> int:
     log.info(f"Inference complete: {len(rows)} predictions")
 
     pred_df = pd.DataFrame(rows)
+
+    # ---- prediction distribution ----
+    item_cols_list = [c for c in ITEM_COLS if c in pred_df.columns]
+    if item_cols_list:
+        vals = pred_df[item_cols_list].values.flatten()
+        total = len(vals)
+        dist = [np.sum(vals == v) / total * 100 for v in range(4)]
+        log.info("prediction distribution: 0=%.1f%% 1=%.1f%% 2=%.1f%% 3=%.1f%%",
+                 dist[0], dist[1], dist[2], dist[3])
 
     # Order rows to match the template CSV.
     if args.template_csv.exists():
