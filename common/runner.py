@@ -133,6 +133,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aux_lupi_reweight", type=int, default=None, help="1=enable sample consistency reweighting")
 
 
+    # S3.1: 概率先验偏置
+    p.add_argument("--use_prior_bias", type=int, default=None, help="1=enable prior bias grid search on val_select (S3.1)")
+    p.add_argument("--prior_bias_alpha_mid", type=float, default=None, help="manual alpha_mid for middle classes (1,2)")
+    p.add_argument("--prior_bias_alpha_ext", type=float, default=None, help="manual alpha_ext for extreme classes (0,3)")
+
     # S2.3: 语言学特征辅助监督
     p.add_argument("--use_aux_linguistic", type=int, default=None, help="1=enable linguistic feature aux supervision")
     p.add_argument("--aux_linguistic_weight", type=float, default=None, help="weight for linguistic aux loss (default 0.1)")
@@ -288,14 +293,114 @@ def _decode_a2_logits(decode_head: nn.Module, logits: torch.Tensor, decode_metho
     return decode_fn(logits.float())
 
 
+def _apply_a2_prior_bias(logits: torch.Tensor, class_weights: torch.Tensor) -> torch.Tensor:
+    """Apply per-item per-class prior bias weights to A2 CORAL logits.
+
+    Converts threshold logits → class probabilities → weight → renormalize →
+    adjusted threshold logits. The output has the same shape and semantics as
+    the input (CORAL threshold logits), so all downstream decode and calibration
+    code works unchanged.
+
+    Args:
+        logits: (N, 21, 3) CORAL threshold logits
+        class_weights: (21, 4) weight per (item, class), e.g.
+            [[α_ext, α_mid, α_mid, α_ext], ...] built from grid-search params
+
+    Returns:
+        adjusted_logits: (N, 21, 3) with prior bias applied
+    """
+    device = logits.device
+    w = class_weights.to(device)  # (21, 4)
+
+    # Threshold probabilities: p(y >= k) for k ∈ {1,2,3}
+    p_cum = torch.sigmoid(logits)  # (N, 21, 3)
+
+    # Class probabilities via threshold differences
+    p0 = 1.0 - p_cum[..., 0:1]          # p(y=0)
+    p1 = p_cum[..., 0:1] - p_cum[..., 1:2]  # p(y=1)
+    p2 = p_cum[..., 1:2] - p_cum[..., 2:3]  # p(y=2)
+    p3 = p_cum[..., 2:3]                     # p(y=3)
+    class_probs = torch.cat([p0, p1, p2, p3], dim=-1)  # (N, 21, 4)
+
+    # Clamp negative values that can arise from non-monotonic threshold logits
+    class_probs = class_probs.clamp(min=0.0)
+
+    # Apply per-class weights and renormalize
+    weighted = class_probs * w.unsqueeze(0)  # (N, 21, 4)
+    weighted = weighted / weighted.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    # Convert back to cumulative (threshold) probabilities
+    cum3 = weighted[..., 3:4]                                          # p(y>=3) = p(y=3)
+    cum2 = weighted[..., 2:3] + cum3                                   # p(y>=2)
+    cum1 = weighted[..., 1:2] + cum2                                   # p(y>=1)
+    new_p_cum = torch.cat([cum1, cum2, cum3], dim=-1)  # (N, 21, 3)
+
+    # Inverse sigmoid → adjusted threshold logits
+    eps = 1e-7
+    new_p_cum = new_p_cum.clamp(eps, 1.0 - eps)
+    return torch.log(new_p_cum / (1.0 - new_p_cum))
+
+
+def _build_prior_class_weights(
+    alpha_mid: float,
+    alpha_ext: float,
+    n_items: int = 21,
+    n_classes: int = 4,
+) -> torch.Tensor:
+    """Build per-item per-class weight tensor for prior bias.
+
+    Middle classes (1, 2) → alpha_mid; extreme classes (0, 3) → alpha_ext.
+    """
+    w = torch.empty(n_items, n_classes, dtype=torch.float32)
+    w[:, 0] = alpha_ext
+    w[:, 1] = alpha_mid
+    w[:, 2] = alpha_mid
+    w[:, 3] = alpha_ext
+    return w
+
+
+def _search_a2_prior_bias(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    decode_head: nn.Module,
+    decode_method: str = "expectation",
+    alpha_mid_range: tuple[float, float, float] = (1.0, 1.5, 0.05),
+    alpha_ext_range: tuple[float, float, float] = (0.7, 1.0, 0.05),
+) -> tuple[float, float, float]:
+    """Grid-search prior bias params (α_mid, α_ext) on val_select.
+
+    Returns (best_alpha_mid, best_alpha_ext, best_qwk).
+    """
+    logits_t = torch.from_numpy(logits).float()
+    best_qwk = -1.0
+    best_mid = 1.0
+    best_ext = 1.0
+
+    for a_mid in np.arange(*alpha_mid_range):
+        for a_ext in np.arange(*alpha_ext_range):
+            w = _build_prior_class_weights(float(a_mid), float(a_ext))
+            adjusted = _apply_a2_prior_bias(logits_t, w)
+            preds = _decode_a2_logits(decode_head, adjusted, decode_method=decode_method)
+            qwk = mean_qwk(preds.cpu().numpy(), labels)
+            if qwk > best_qwk:
+                best_qwk = float(qwk)
+                best_mid = float(a_mid)
+                best_ext = float(a_ext)
+
+    return best_mid, best_ext, best_qwk
+
+
 def _evaluate_a2_decode_candidates(
     decode_head: nn.Module,
     logits: torch.Tensor,
     labels: np.ndarray,
     decode_methods: list[str],
     offsets: np.ndarray | None = None,
+    prior_weights: torch.Tensor | None = None,
 ) -> dict[str, dict[str, float | np.ndarray | str]]:
     logits_f = logits.float()
+    if prior_weights is not None:
+        logits_f = _apply_a2_prior_bias(logits_f, prior_weights)
     if offsets is not None:
         logits_f = logits_f + torch.as_tensor(offsets, device=logits_f.device, dtype=torch.float32)
 
@@ -1030,6 +1135,7 @@ def generate_submission_grouped(
     a1_biases: np.ndarray | None = None,
     decode_method: str = "expectation",
     a2_threshold_offsets: np.ndarray | None = None,
+    a2_prior_weights: torch.Tensor | None = None,
 ):
     grouped_model.eval()
     participant_head.eval()
@@ -1074,6 +1180,8 @@ def generate_submission_grouped(
             preds = torch.sigmoid(logits_f).cpu().numpy()
         else:
             logits_f = logits.float()
+            if a2_prior_weights is not None:
+                logits_f = _apply_a2_prior_bias(logits_f, a2_prior_weights)
             if a2_offsets_t is not None:
                 logits_f = logits_f + a2_offsets_t
             # 根据submission_level选择对应的head用于解码
@@ -1158,6 +1266,78 @@ def collect_val_logits_grouped_a2(grouped_model, participant_head, session_head,
         all_logits.append(logits)
         all_labels.append(labels)
     return np.concatenate(all_logits), np.concatenate(all_labels)
+
+
+@torch.no_grad()
+def _collect_ensemble_logits_a2(
+    ckpt_paths: list[Path],
+    grouped_model: GroupedModel,
+    participant_head: nn.Module,
+    session_head: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+    submission_level: str = "participant",
+    enable_mtl: bool = False,
+    optimized_model: nn.Module | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collect A2 logits from K checkpoints and average them (FP32).
+
+    Each checkpoint is loaded independently; logits are collected in FP32,
+    averaged across checkpoints, then returned with the corresponding labels.
+    Labels are identical across checkpoints (same data), so we take them from
+    the first checkpoint.
+    """
+    all_ckpt_logits: list[np.ndarray] = []
+    labels: np.ndarray | None = None
+
+    for ckpt_path in ckpt_paths:
+        if not ckpt_path.exists():
+            continue
+        state = load_checkpoint(ckpt_path, optimized_model if enable_mtl else grouped_model, optimizer=None)
+        if enable_mtl and optimized_model is not None:
+            optimized_model.to(device)
+        else:
+            if not enable_mtl:
+                participant_head.load_state_dict(state["participant_head_state_dict"])
+                session_head.load_state_dict(state["session_head_state_dict"])
+            grouped_model.to(device)
+            participant_head.to(device)
+            session_head.to(device)
+
+        logits_list, labels_list = [], []
+        for batch in loader:
+            if batch is None:
+                continue
+            flat_batch = _to_device(batch["flat_batch"], device)
+            session_valid = batch["session_valid"].to(device)
+            B = batch["n_participants"]
+            aux_attrs = batch.get("participant_aux_attrs")
+            if aux_attrs is not None:
+                aux_attrs = aux_attrs.to(device)
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+                out = grouped_model(flat_batch, B, session_valid, aux_attrs)
+                if submission_level == "participant":
+                    logits = participant_head(out["participant_repr"]).float().cpu().numpy()
+                    lbls = batch["participant_y_a2"].numpy()
+                else:
+                    valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
+                    logits = session_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
+                    lbls = batch["participant_y_a2"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21).numpy()
+                    lbls = lbls[valid_session_mask]
+            logits_list.append(logits)
+            labels_list.append(lbls)
+
+        all_ckpt_logits.append(np.concatenate(logits_list))
+        if labels is None:
+            labels = np.concatenate(labels_list)
+
+    if len(all_ckpt_logits) == 0:
+        raise RuntimeError("No top-K checkpoints found for ensemble")
+
+    # Average logits in FP32
+    ensemble_logits = np.mean(np.stack(all_ckpt_logits), axis=0)
+    return ensemble_logits, labels  # type: ignore[return-value]
 
 
 def calibrate_a2_thresholds(logits, labels, n_items=21, n_thresholds=3,
@@ -1594,6 +1774,21 @@ def main() -> None:
         ).to(device)
         log.info(f"Class-Balanced weights enabled: beta={cb_beta}, shape={cb_weights_t.shape}")
 
+    # S3.1: 概率先验偏置
+    use_prior_bias = bool(cfg.get("use_prior_bias", False))
+    prior_bias_alpha_mid = cfg.get("prior_bias_alpha_mid", None)
+    prior_bias_alpha_ext = cfg.get("prior_bias_alpha_ext", None)
+    prior_weights: torch.Tensor | None = None
+    if task == "a2" and use_prior_bias:
+        if prior_bias_alpha_mid is not None and prior_bias_alpha_ext is not None:
+            prior_weights = _build_prior_class_weights(prior_bias_alpha_mid, prior_bias_alpha_ext)
+            log.info(
+                f"Prior bias enabled (manual): alpha_mid={prior_bias_alpha_mid}, "
+                f"alpha_ext={prior_bias_alpha_ext}"
+            )
+        else:
+            log.info("Prior bias will be grid-searched on val_select after training")
+
     # 优化器参数
     if enable_mtl:
         params = list(optimized_model.parameters())
@@ -1647,6 +1842,19 @@ def main() -> None:
 
     best_metric = -1.0
     metric_name = "F1" if task == "a1" else "QWK"
+
+    # S3.2: Top-K checkpoint ensemble — 维护按 val_select QWK 排序的 top-K 检查点
+    top_k_ensemble = max(0, int(cfg.get("top_k_ensemble", 0)))
+    topk_entries: list[tuple[float, int]] = []  # (qwk, epoch), best first
+
+    # S3.3: SWA (Stochastic Weight Averaging) — 等权平均, epoch N≥swa_start 后启动
+    use_swa = bool(cfg.get("use_swa", False))
+    swa_start_epoch = max(1, int(cfg.get("swa_start_epoch", 7)))
+    swa_state: dict[str, torch.Tensor] = {}
+    swa_n = 0
+    if use_swa:
+        log.info(f"SWA enabled: start epoch={swa_start_epoch}, equal-weight averaging")
+
     t_start = time.time()
 
     log.info("=" * 110)
@@ -1821,6 +2029,46 @@ def main() -> None:
                 },
             )
 
+        # S3.2: Top-K ensemble checkpoint management — keep per-epoch ckpts, rank at inference
+        if task == "a2" and top_k_ensemble > 0:
+            qwk = val_metrics.get("mean_qwk", primary)
+            # Save a per-epoch checkpoint for this epoch
+            ep_ckpt = run_dirs["checkpoints"] / f"ckpt_epoch{epoch:03d}.pt"
+            if enable_mtl:
+                save_checkpoint(ep_ckpt, optimized_model, optimizer, epoch, qwk,
+                                extra={"enable_mtl": True})
+            else:
+                save_checkpoint(ep_ckpt, grouped_model, optimizer, epoch, qwk,
+                                extra={
+                                    "participant_head_state_dict": participant_head.state_dict(),
+                                    "session_head_state_dict": session_head.state_dict(),
+                                    "enable_mtl": False,
+                                })
+            # Update top-K queue
+            topk_entries.append((qwk, epoch))
+            topk_entries.sort(key=lambda x: x[0], reverse=True)
+            # Keep only top K; delete ckpt files for pruned epochs
+            pruned = topk_entries[top_k_ensemble:]
+            topk_entries = topk_entries[:top_k_ensemble]
+            for _, ep_pruned in pruned:
+                stale = run_dirs["checkpoints"] / f"ckpt_epoch{ep_pruned:03d}.pt"
+                if stale.exists():
+                    stale.unlink()
+
+        # S3.3: SWA — update running average after swa_start_epoch
+        if use_swa and task == "a2" and epoch >= swa_start_epoch:
+            model_for_swa = optimized_model if enable_mtl else grouped_model
+            for name, param in model_for_swa.named_parameters():
+                if swa_n == 0:
+                    swa_state[name] = param.data.detach().cpu().clone()
+                else:
+                    swa_state[name] = swa_state[name].to(param.device)
+                    swa_state[name].mul_(swa_n / (swa_n + 1.0)).add_(
+                        param.data.detach(), alpha=1.0 / (swa_n + 1.0)
+                    )
+                    swa_state[name] = swa_state[name].cpu()
+            swa_n += 1
+
         # 始终在 val_select 上判断早停
         es_value = val_metrics["loss"] if early_stop_metric == "val_loss" else primary
         if early_stop.step(es_value):
@@ -1830,6 +2078,31 @@ def main() -> None:
     log.info("=" * 90)
     total_time = time.time() - t_start
     log.info(f"Training complete. Best {metric_name}={best_metric:.4f}, time={_fmt_duration(total_time)}")
+
+    # S3.3: Save SWA checkpoint if enabled and epochs were averaged
+    swa_ckpt_path: Path | None = None
+    if use_swa and swa_n > 0:
+        log.info(f"Saving SWA checkpoint (averaged {swa_n} epochs from epoch {swa_start_epoch})...")
+        model_for_swa_save = optimized_model if enable_mtl else grouped_model
+        # Temporarily load SWA weights into model for saving
+        orig_state = {n: p.data.detach().cpu().clone() for n, p in model_for_swa_save.named_parameters()}
+        for name, param in model_for_swa_save.named_parameters():
+            param.data.copy_(swa_state[name].to(param.device))
+        swa_ckpt_path = run_dirs["checkpoints"] / "swa.pt"
+        if enable_mtl:
+            save_checkpoint(swa_ckpt_path, optimized_model, optimizer, 0, 0.0,
+                            extra={"enable_mtl": True, "swa_n": swa_n,
+                                   "swa_start_epoch": swa_start_epoch})
+        else:
+            save_checkpoint(swa_ckpt_path, grouped_model, optimizer, 0, 0.0,
+                            extra={"participant_head_state_dict": participant_head.state_dict(),
+                                   "session_head_state_dict": session_head.state_dict(),
+                                   "enable_mtl": False, "swa_n": swa_n,
+                                   "swa_start_epoch": swa_start_epoch})
+        # Restore original weights
+        for name, param in model_for_swa_save.named_parameters():
+            param.data.copy_(orig_state[name].to(param.device))
+        log.info(f"  SWA checkpoint saved: {swa_ckpt_path}")
 
     log.info("Loading best checkpoint for submission generation ...")
     state = load_checkpoint(run_dirs["checkpoints"] / "best.pt",
@@ -1913,29 +2186,64 @@ def main() -> None:
     else:
         cal_source = "val_select" if val_holdout_loader is not None else "val"
         log.info(f"Calibrating and selecting A2 decode strategy on {cal_source} ...")
-        val_logits, val_labels = collect_val_logits_grouped_a2(
-            grouped_model, participant_head, session_head, val_select_loader, device, use_amp,
-            submission_level=submission_level,
-        )
+
+        # S3.2: Top-K ensemble — collect and average logits from K checkpoints
+        use_topk = task == "a2" and top_k_ensemble > 0 and len(topk_entries) > 1
+        if use_topk:
+            ensemble_n = min(len(topk_entries), top_k_ensemble)
+            log.info(f"  Top-{ensemble_n} ensemble: averaging logits from epochs {[e for _, e in topk_entries[:ensemble_n]]}")
+            ckpt_paths = [run_dirs["checkpoints"] / f"ckpt_epoch{ep:03d}.pt" for _, ep in topk_entries[:ensemble_n]]
+            val_logits, val_labels = _collect_ensemble_logits_a2(
+                ckpt_paths, grouped_model, participant_head, session_head,
+                val_select_loader, device, use_amp,
+                submission_level=submission_level,
+                enable_mtl=enable_mtl, optimized_model=optimized_model if enable_mtl else None,
+            )
+        else:
+            val_logits, val_labels = collect_val_logits_grouped_a2(
+                grouped_model, participant_head, session_head, val_select_loader, device, use_amp,
+                submission_level=submission_level,
+            )
         val_labels_int = val_labels.astype(int)
         # 根据submission_level选择对应的head用于解码
         decode_head = participant_head if submission_level == "participant" else session_head
+
+        # S3.1: 概率先验偏置 — 在 val_select 上网格搜索最优 α_mid / α_ext
+        prior_weights_final = prior_weights  # may be set from config or CLI
+        if use_prior_bias and prior_weights is None:
+            prior_search_method = decode_method if decode_method != "auto" else "expectation"
+            best_mid, best_ext, best_pqwk = _search_a2_prior_bias(
+                val_logits, val_labels_int, decode_head, decode_method=prior_search_method,
+            )
+            prior_weights_final = _build_prior_class_weights(best_mid, best_ext)
+            log.info(
+                f"  Prior bias grid search: α_mid={best_mid:.2f}, α_ext={best_ext:.2f}, "
+                f"QWK={best_pqwk:.4f}"
+            )
+
+        # Build prior-biased logits for downstream calibration (if prior bias enabled)
+        val_logits_biased = val_logits
+        if prior_weights_final is not None:
+            val_logits_biased = _apply_a2_prior_bias(
+                torch.from_numpy(val_logits).float(), prior_weights_final,
+            ).cpu().numpy()
+
         raw_results = _evaluate_a2_decode_candidates(
             decode_head,
-            torch.from_numpy(val_logits).float(),
+            torch.from_numpy(val_logits_biased).float(),
             val_labels_int,
             decode_methods=["argmax", "monotonic", "expectation"],
         )
         calibrated_results = {}
         for method in ("argmax", "monotonic", "expectation"):
             offsets, item_qwks = calibrate_a2_thresholds(
-                val_logits,
+                val_logits_biased,
                 val_labels_int,
                 decode_method=method,
             )
             preds = _decode_a2_logits(
                 decode_head,
-                torch.from_numpy(val_logits).float() + torch.as_tensor(offsets, dtype=torch.float32),
+                torch.from_numpy(val_logits_biased).float() + torch.as_tensor(offsets, dtype=torch.float32),
                 decode_method=method,
             ).cpu().numpy()
             calibrated_results[f"calibrated_{method}"] = {
@@ -1973,20 +2281,34 @@ def main() -> None:
         val_hout_qwk_cal = None
         val_hout_mae_cal = None
         if val_holdout_loader is not None:
-            hout_logits, hout_labels = collect_val_logits_grouped_a2(
-                grouped_model, participant_head, session_head, val_holdout_loader, device, use_amp,
-                submission_level=submission_level,
-            )
+            if use_topk:
+                ensemble_n = min(len(topk_entries), top_k_ensemble)
+                ckpt_paths = [run_dirs["checkpoints"] / f"ckpt_epoch{ep:03d}.pt" for _, ep in topk_entries[:ensemble_n]]
+                hout_logits, hout_labels = _collect_ensemble_logits_a2(
+                    ckpt_paths, grouped_model, participant_head, session_head,
+                    val_holdout_loader, device, use_amp,
+                    submission_level=submission_level,
+                    enable_mtl=enable_mtl, optimized_model=optimized_model if enable_mtl else None,
+                )
+            else:
+                hout_logits, hout_labels = collect_val_logits_grouped_a2(
+                    grouped_model, participant_head, session_head, val_holdout_loader, device, use_amp,
+                    submission_level=submission_level,
+                )
             hout_labels_int = hout_labels.astype(int)
             # 使用 val_select 上选定的最佳策略评估 val_holdout
-            hout_preds_cal = _decode_a2_logits(
-                decode_head,
-                torch.from_numpy(hout_logits).float() + (torch.as_tensor(a2_offsets, dtype=torch.float32) if a2_offsets is not None else 0.0),
+            hout_logits_t = torch.from_numpy(hout_logits).float()
+            if prior_weights_final is not None:
+                hout_logits_t = _apply_a2_prior_bias(hout_logits_t, prior_weights_final)
+            hout_preds_raw = _decode_a2_logits(
+                decode_head, hout_logits_t,
                 decode_method=selected_decode_method,
             ).cpu().numpy()
-            hout_preds_raw = _decode_a2_logits(
-                decode_head,
-                torch.from_numpy(hout_logits).float(),
+            hout_logits_cal = hout_logits_t
+            if a2_offsets is not None:
+                hout_logits_cal = hout_logits_t + torch.as_tensor(a2_offsets, dtype=torch.float32)
+            hout_preds_cal = _decode_a2_logits(
+                decode_head, hout_logits_cal,
                 decode_method=selected_decode_method,
             ).cpu().numpy()
             val_hout_qwk_raw = mean_qwk(hout_preds_raw, hout_labels_int)
@@ -2004,6 +2326,46 @@ def main() -> None:
                 f"0={hout_dist[0]:.1f}% 1={hout_dist[1]:.1f}% 2={hout_dist[2]:.1f}% 3={hout_dist[3]:.1f}%"
             )
 
+        # S3.3: Evaluate SWA checkpoint if available
+        val_hout_qwk_swa = None
+        val_hout_mae_swa = None
+        if use_swa and swa_ckpt_path is not None and swa_ckpt_path.exists() and val_holdout_loader is not None:
+            log.info("  Evaluating SWA checkpoint on val_holdout ...")
+            for name, param in (optimized_model if enable_mtl else grouped_model).named_parameters():
+                param.data.copy_(swa_state[name].to(param.device))
+            # SWA uses same decode/offsets/prior as best
+            swa_logits, swa_labels = collect_val_logits_grouped_a2(
+                grouped_model, participant_head, session_head, val_holdout_loader, device, use_amp,
+                submission_level=submission_level,
+            )
+            swa_labels_int = swa_labels.astype(int)
+            swa_logits_t = torch.from_numpy(swa_logits).float()
+            if prior_weights_final is not None:
+                swa_logits_t = _apply_a2_prior_bias(swa_logits_t, prior_weights_final)
+            if a2_offsets is not None:
+                swa_logits_t = swa_logits_t + torch.as_tensor(a2_offsets, dtype=torch.float32)
+            swa_preds = _decode_a2_logits(
+                decode_head, swa_logits_t,
+                decode_method=selected_decode_method,
+            ).cpu().numpy()
+            val_hout_qwk_swa = mean_qwk(swa_preds, swa_labels_int)
+            val_hout_mae_swa = mean_mae(swa_preds, swa_labels_int)
+            log.info(
+                f"  [SWA] val_holdout: calibrated QWK={val_hout_qwk_swa:.4f}, "
+                f"MAE={val_hout_mae_swa:.4f}  (best.pt QWK={val_hout_qwk_cal:.4f})"
+            )
+            # Restore best checkpoint weights
+            load_checkpoint(run_dirs["checkpoints"] / "best.pt",
+                           optimized_model if enable_mtl else grouped_model, optimizer=None)
+            if not enable_mtl:
+                participant_head.load_state_dict(state["participant_head_state_dict"])
+                session_head.load_state_dict(state["session_head_state_dict"])
+                grouped_model.to(device)
+                participant_head.to(device)
+                session_head.to(device)
+            else:
+                optimized_model.to(device)
+
         meta.set_extra("final_selected_strategy", best_strategy)
         meta.set_extra("final_selected_metrics", {
             "val_select_qwk_calibrated": float(best_result["qwk"]),
@@ -2011,8 +2373,17 @@ def main() -> None:
             "val_holdout_qwk_raw": float(val_hout_qwk_raw) if val_hout_qwk_raw is not None else None,
             "val_holdout_qwk_calibrated": float(val_hout_qwk_cal) if val_hout_qwk_cal is not None else None,
             "val_holdout_mae_calibrated": float(val_hout_mae_cal) if val_hout_mae_cal is not None else None,
+            "val_holdout_qwk_swa": float(val_hout_qwk_swa) if val_hout_qwk_swa is not None else None,
+            "val_holdout_mae_swa": float(val_hout_mae_swa) if val_hout_mae_swa is not None else None,
             "decode_method": selected_decode_method,
             "calibration_source": cal_source,
+            "prior_bias_enabled": use_prior_bias,
+            "prior_bias_alpha_mid": float(prior_weights_final[0, 1].item()) if prior_weights_final is not None else None,
+            "prior_bias_alpha_ext": float(prior_weights_final[0, 0].item()) if prior_weights_final is not None else None,
+            "top_k_ensemble": top_k_ensemble,
+            "topk_epochs": [int(e) for _, e in topk_entries[:top_k_ensemble]] if top_k_ensemble > 0 else [],
+            "swa_enabled": use_swa,
+            "swa_n_epochs": swa_n,
         })
 
         cal_data = {
@@ -2024,6 +2395,11 @@ def main() -> None:
             "val_holdout_qwk_raw": float(val_hout_qwk_raw) if val_hout_qwk_raw is not None else None,
             "val_holdout_qwk_calibrated": float(val_hout_qwk_cal) if val_hout_qwk_cal is not None else None,
             "val_holdout_mae_calibrated": float(val_hout_mae_cal) if val_hout_mae_cal is not None else None,
+            "prior_bias": {
+                "enabled": use_prior_bias,
+                "alpha_mid": float(prior_weights_final[0, 1].item()) if prior_weights_final is not None else None,
+                "alpha_ext": float(prior_weights_final[0, 0].item()) if prior_weights_final is not None else None,
+            } if use_prior_bias else None,
             "strategies": {
                 name: {
                     "decode_method": str(result["decode_method"]),
@@ -2072,6 +2448,7 @@ def main() -> None:
                 a1_biases=a1_biases,
                 decode_method=submit_decode,
                 a2_threshold_offsets=submit_offsets,
+                a2_prior_weights=prior_weights_final if use_prior_bias else None,
             )
 
             manifest_df = pd.read_csv(manifest_path)

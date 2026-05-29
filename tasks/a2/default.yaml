@@ -67,6 +67,19 @@ qwk_weight: 0.3
 use_cb_weight: 0
 cb_beta: 0.999
 
+# S3.1: 概率先验偏置 — 推理时对类别概率加权，缓解预测分布扁平化
+# 0=禁用, 1=在 val_select 上网格搜索 α_mid/α_ext
+use_prior_bias: 0
+
+# S3.2: Top-K Checkpoint Ensemble — 推理时平均 K 个最优 checkpoint 的 logits
+# 0=禁用, 3=推荐, 5=保守
+top_k_ensemble: 0
+
+# S3.3: SWA (Stochastic Weight Averaging) — 等权平均 epoch 7+ 的权重
+# 0=禁用, 1=启用
+use_swa: 0
+swa_start_epoch: 7
+
 # LUPI: Learning Using Privileged Information
 # Stage 2.3: 语言学特征辅助监督 (offline extraction via scripts/extract_linguistic_features.py)
 use_aux_linguistic: 0

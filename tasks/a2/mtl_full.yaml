@@ -132,6 +132,16 @@ aux_linguistic_weight: 0.1
 aux_linguistic_hidden: 64
 linguistic_root: /data1/AdoDas/linguistic_features
 
+# S3.1: 概率先验偏置 — 推理时对类别概率加权，缓解预测分布扁平化
+use_prior_bias: 0
+
+# S3.2: Top-K Checkpoint Ensemble
+top_k_ensemble: 0
+
+# S3.3: SWA
+use_swa: 0
+swa_start_epoch: 7
+
 aux_lupi:
   enabled: false                     # 默认关闭，通过 --lupi 独立控制
   aux_heads:                        # 从 participant_repr 预测 5 个辅助属性
