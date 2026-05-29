@@ -429,6 +429,95 @@ def run_inference(
     return out_rows
 
 
+@torch.no_grad()
+def run_inference_ensemble(
+    ckpt_paths: list[Path],
+    cfg: dict,
+    loader: DataLoader,
+    device: torch.device,
+    decode_method: str,
+) -> list[dict[str, Any]]:
+    """Top-K logit ensemble: load K checkpoints, average logits in FP32."""
+    method = _normalize_decode_method(decode_method)
+    K = len(ckpt_paths)
+    log.info(f"Top-{K} ensemble: averaging logits from {K} checkpoints, decode={method}")
+
+    # Build a model + head pair for each checkpoint
+    head_state_dicts: list[dict[str, torch.Tensor]] = []
+    model_state_dicts: list[dict[str, torch.Tensor]] = []
+    grouped_models: list[GroupedModel] = []
+    participant_heads: list[torch.nn.Module] = []
+
+    for ckpt_path in ckpt_paths:
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        full_sd = ckpt["model_state_dict"]
+        model_sd, head_sd = _extract_state_dicts(full_sd, ckpt)
+        gm, ph, *_ = build_model_from_config(cfg, model_sd)
+        gm.load_state_dict(model_sd, strict=False)
+        ph.load_state_dict(head_sd, strict=True)
+        gm.to(device).eval()
+        ph.to(device).eval()
+        grouped_models.append(gm)
+        participant_heads.append(ph)
+
+    out_rows: list[dict[str, Any]] = []
+    pbar = tqdm(loader, desc=f"Top-{K} ensemble", dynamic_ncols=True, unit="batch")
+    for batch in pbar:
+        if batch is None:
+            continue
+        flat = _to_device(batch["flat_batch"], device)
+        valid = batch["session_valid"].to(device)
+        aux = batch.get("participant_aux_attrs")
+        aux = aux.to(device) if aux is not None else None
+        n_p = int(batch["n_participants"])
+
+        # Collect logits from all K checkpoints in FP32
+        all_logits = []
+        for gm, ph in zip(grouped_models, participant_heads):
+            result = gm(flat, n_p, valid, aux)
+            logits = ph(result["participant_repr"]).float()
+            all_logits.append(logits)
+
+        # Average in FP32, then decode
+        avg_logits = torch.stack(all_logits).mean(dim=0)
+        preds = _decode_a2_logits(participant_heads[0], avg_logits, decode_method=method)
+        preds_np = preds.detach().cpu().numpy().astype(int)
+
+        for i in range(n_p):
+            row = {
+                "anon_school": batch["anon_schools"][i],
+                "anon_class": batch["anon_classes"][i],
+                "anon_pid": batch["anon_pids"][i],
+            }
+            for j, col in enumerate(ITEM_COLS):
+                row[col] = int(preds_np[i, j])
+            out_rows.append(row)
+
+        pbar.set_postfix({"participants": len(out_rows)})
+
+    return out_rows
+
+
+def _extract_state_dicts(full_sd: dict, ckpt: dict) -> tuple[dict, dict]:
+    """Extract (model_sd, head_sd) from MTL or non-MTL checkpoint."""
+    has_mtl_prefix = any(k.startswith("grouped_model.") for k in full_sd)
+    if has_mtl_prefix:
+        model_sd: dict[str, torch.Tensor] = {}
+        head_sd: dict[str, torch.Tensor] = {}
+        for k, v in full_sd.items():
+            if k.startswith("grouped_model."):
+                model_sd[k[len("grouped_model."):]] = v
+            elif k.startswith("participant_head."):
+                head_sd[k[len("participant_head."):]] = v
+    elif "participant_head_state_dict" in ckpt:
+        model_sd = {k: v for k, v in full_sd.items()}
+        head_sd = ckpt["participant_head_state_dict"]
+    else:
+        model_sd = {k: v for k, v in full_sd.items()}
+        head_sd = {}
+    return model_sd, head_sd
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -464,6 +553,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--calibrate", action="store_true",
                    help="Opt-in: load calibration offsets and use the val-selected decode "
                         "strategy (default: pure argmax, no calibration)")
+    p.add_argument("--topk", type=int, default=0,
+                   help="Top-K ensemble: average logits from K checkpoints "
+                        "(reads topk_epochs from run_meta.json, or scans ckpt_epoch*.pt)")
     return p.parse_args()
 
 
@@ -621,7 +713,23 @@ def main() -> int:
     )
 
     # ---- calibration & decode ----
-    if args.calibrate:
+    if args.topk > 0:
+        # Top-K ensemble: find epoch checkpoints from run_meta or scan
+        topk_epochs = meta.get("topk_epochs") or meta.get("final_selected_metrics", {}).get("topk_epochs", [])
+        if not topk_epochs:
+            # Fallback: scan ckpt_epoch*.pt files
+            ckpt_dir = run_dir / "checkpoints"
+            epoch_files = sorted(ckpt_dir.glob("ckpt_epoch*.pt"))
+            topk_epochs = [int(f.stem.replace("ckpt_epoch", "")) for f in epoch_files]
+        K_actual = min(args.topk, len(topk_epochs))
+        if K_actual == 0:
+            log.error("No top-K checkpoints found (run did not use --top_k_ensemble?)")
+            return 2
+        ckpt_paths = [run_dir / "checkpoints" / f"ckpt_epoch{ep:03d}.pt" for ep in topk_epochs[:K_actual]]
+        decode_method = "argmax"
+        log.info("Top-%d ensemble: raw argmax, no calibration", K_actual)
+        log.info("  epochs: %s", topk_epochs[:K_actual])
+    elif args.calibrate:
         decode_method, offsets = load_calibration(run_dir)
         log.info("calibration applied: %s, decode: %s",
                  offsets is not None, decode_method)
@@ -633,8 +741,11 @@ def main() -> int:
 
     log.info(f"Running inference: {len(dataset)} participants, "
              f"batch_size={args.batch_size}, workers={args.num_workers} ...")
-    rows = run_inference(grouped_model, participant_head, loader, device,
-                         decode_method, offsets)
+    if args.topk > 0:
+        rows = run_inference_ensemble(ckpt_paths, cfg, loader, device, decode_method)
+    else:
+        rows = run_inference(grouped_model, participant_head, loader, device,
+                             decode_method, offsets)
     log.info(f"Inference complete: {len(rows)} predictions")
 
     pred_df = pd.DataFrame(rows)
