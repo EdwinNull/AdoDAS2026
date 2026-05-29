@@ -138,6 +138,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prior_bias_alpha_mid", type=float, default=None, help="manual alpha_mid for middle classes (1,2)")
     p.add_argument("--prior_bias_alpha_ext", type=float, default=None, help="manual alpha_ext for extreme classes (0,3)")
 
+    # S3.2: Top-K Checkpoint Ensemble
+    p.add_argument("--top_k_ensemble", type=int, default=None, help="number of top checkpoints for logit ensemble (0=disabled, 3=recommended)")
+
+    # S3.3: SWA
+    p.add_argument("--use_swa", type=int, default=None, help="1=enable Stochastic Weight Averaging from epoch swa_start")
+    p.add_argument("--swa_start_epoch", type=int, default=None, help="epoch to start SWA averaging (default 7)")
+
     # S2.3: 语言学特征辅助监督
     p.add_argument("--use_aux_linguistic", type=int, default=None, help="1=enable linguistic feature aux supervision")
     p.add_argument("--aux_linguistic_weight", type=float, default=None, help="weight for linguistic aux loss (default 0.1)")
