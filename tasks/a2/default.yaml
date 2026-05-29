@@ -68,6 +68,11 @@ use_cb_weight: 0
 cb_beta: 0.999
 
 # LUPI: Learning Using Privileged Information
+# Stage 2.3: 语言学特征辅助监督 (offline extraction via scripts/extract_linguistic_features.py)
+use_aux_linguistic: 0
+aux_linguistic_weight: 0.1
+aux_linguistic_hidden: 64
+linguistic_root: /data1/AdoDas/linguistic_features
 aux_lupi:
   enabled: false
   aux_heads:                        # 从 participant_repr 预测 5 个辅助属性

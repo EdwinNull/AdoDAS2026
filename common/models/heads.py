@@ -567,3 +567,49 @@ def aux_attribute_loss(
         acc_dict[name] = (preds == targets).float().mean().item()
 
     return total, acc_dict
+
+
+# ---------------------------------------------------------------------------
+# S2.3: 语言学特征预测头 (LUPI — 从转录文本离线提取)
+# ---------------------------------------------------------------------------
+
+N_LINGUISTIC_FEATURES = 12
+
+
+class AuxLinguisticHead(nn.Module):
+    """从 participant_repr 预测 12-dim 语言学特征 (MSE 回归).
+
+    语言学特征从 clean_transcript.txt 离线提取 (scripts/extract_linguistic_features.py):
+      0. word_count          1. unique_ratio        2. mean_word_len
+      3. segment_count       4. total_duration_sec  5. speech_rate
+      6. first_person_ratio  7. negation_ratio      8. cognitive_ratio
+      9. neg_emotion_ratio   10. pos_emotion_ratio  11. filler_ratio
+    """
+
+    def __init__(self, d_in: int, hidden: int = 64, dropout: float = 0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_in, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, N_LINGUISTIC_FEATURES),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)  # (B, 12)
+
+
+def aux_linguistic_loss(
+    pred: torch.Tensor,
+    targets: torch.Tensor,
+    weight: float = 0.1,
+) -> torch.Tensor:
+    """MSE loss between predicted and actual linguistic features."""
+    valid = ~torch.isnan(targets).any(dim=-1)
+    if valid.sum() == 0:
+        return pred.new_zeros(())
+    return weight * F.mse_loss(pred[valid], targets[valid])
+
+    return total, acc_dict
+
+    return total, acc_dict

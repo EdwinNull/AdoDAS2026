@@ -158,6 +158,7 @@ class GroupedModel(nn.Module):
         dropout: float = 0.2,
         aux_encoder=None,
         aux_heads=None,
+        aux_linguistic_head=None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -168,6 +169,7 @@ class GroupedModel(nn.Module):
         self.session_type_head = SessionTypeClassifier(d_in=d_shared)
         self.aux_encoder = aux_encoder
         self.aux_heads = aux_heads
+        self.aux_linguistic_head = aux_linguistic_head
 
     def forward(
         self,
@@ -204,6 +206,11 @@ class GroupedModel(nn.Module):
         if self.aux_heads is not None:
             aux_logits = self.aux_heads(participant_repr)
 
+        # S2.3: 预测语言学特征 (从纯音视频表示)
+        aux_ling_pred = None
+        if self.aux_linguistic_head is not None:
+            aux_ling_pred = self.aux_linguistic_head(participant_repr)
+
         # 如果启用辅助属性，编码并拼接到参与者表示
         if self.aux_encoder is not None and aux_attrs is not None:
             aux_encoded = self.aux_encoder(aux_attrs)  # (B, aux_dim)
@@ -217,6 +224,7 @@ class GroupedModel(nn.Module):
             "participant_repr": participant_repr,
             "session_type_logits": session_type_logits,
             "aux_logits": aux_logits,
+            "aux_ling_pred": aux_ling_pred,
         }
 
 

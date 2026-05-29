@@ -24,7 +24,7 @@ from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
 from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
 from .data.hdf5_dataset import HDF5GroupedDataset
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
-from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss, AuxAttributeHeads, aux_attribute_loss
+from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss, AuxAttributeHeads, aux_attribute_loss, AuxLinguisticHead, aux_linguistic_loss
 from .models.grouped_model import GroupedModel, CORALHead
 from .models.phase1_integration import OptimizedGroupedModel, compute_optimized_loss
 from .utils.seed import seed_everything
@@ -131,6 +131,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aux_lupi_heads", type=int, default=None, help="1=enable aux attribute prediction heads")
     p.add_argument("--aux_lupi_reweight", type=int, default=None, help="1=enable sample consistency reweighting")
 
+
+    # S2.3: 语言学特征辅助监督
+    p.add_argument("--use_aux_linguistic", type=int, default=None, help="1=enable linguistic feature aux supervision")
+    p.add_argument("--aux_linguistic_weight", type=float, default=None, help="weight for linguistic aux loss (default 0.1)")
+    p.add_argument("--linguistic_root", type=str, default=None, help="root dir for pre-extracted linguistic features")
     # 跨模态注意力参数
     p.add_argument("--use_cross_modal", type=int, default=None, help="1=enable bidirectional cross-modal attention (TCN -> CM-Attn -> ASP)")
     p.add_argument("--cm_n_heads", type=int, default=None, help="Number of heads for cross-modal attention")

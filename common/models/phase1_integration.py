@@ -90,6 +90,7 @@ class OptimizedGroupedModel(nn.Module):
             "session_type_logits": backbone_out["session_type_logits"],
             "session_reprs": backbone_out["session_reprs"],
             "aux_logits": backbone_out.get("aux_logits"),
+            "aux_ling_pred": backbone_out.get("aux_ling_pred"),
         }
 
         # 辅助任务预测

@@ -126,6 +126,12 @@ session_drop_prob: 0.1            # 会话级dropout
 submission_level: participant
 decode_method: auto
 
+# Stage 2.3: 语言学特征辅助监督 (offline extraction via scripts/extract_linguistic_features.py)
+use_aux_linguistic: 0
+aux_linguistic_weight: 0.1
+aux_linguistic_hidden: 64
+linguistic_root: /data1/AdoDas/linguistic_features
+
 aux_lupi:
   enabled: false                     # 默认关闭，通过 --lupi 独立控制
   aux_heads:                        # 从 participant_repr 预测 5 个辅助属性

@@ -296,6 +296,44 @@ Encoded via `AuxiliaryAttributeEncoder` with embedding layers, concatenated to p
 
 详见 `docs/AUX_LUPI_PLAN.md`。
 
+### Stage 2.3: Linguistic Features (auxiliary supervision from transcripts)
+
+Training data includes ASR transcripts (`{train,val,test}_transcript/`) with per-session
+`clean_transcript.txt` + time-aligned `segments.csv`. Offline extraction produces 12-dim
+linguistic feature vectors per session (pooled to participant-level via mean):
+
+| dim | feature | description |
+|-----|---------|-------------|
+| 0 | word_count | total jieba-segmented words |
+| 1 | unique_ratio | unique / total words |
+| 2 | mean_word_len | avg chars per word |
+| 3 | segment_count | number of speech segments |
+| 4 | total_duration_sec | total speech duration |
+| 5 | speech_rate | chars per second |
+| 6 | first_person_ratio | 我/我的/我们 / total |
+| 7 | negation_ratio | 不/没/没有/不会 / total |
+| 8 | cognitive_ratio | 觉得/知道/可能/因为 / total |
+| 9 | neg_emotion_ratio | 难过/害怕/紧张/担心 / total |
+| 10 | pos_emotion_ratio | 开心/快乐/高兴/喜欢 / total |
+| 11 | filler_ratio | 嗯/呃/那个/就是 / total |
+
+**Extraction** (one-time, offline):
+```bash
+python scripts/extract_linguistic_features.py --split all
+```
+
+**Training** (LUPI: features used as aux targets, not required at inference):
+```bash
+python train.py --task a2 --config tasks/a2/mtl_full.yaml \
+    --aux_lupi_enabled 1 --aux_lupi_heads 1 --aux_lupi_reweight 1 \
+    --use_aux_linguistic 1 --aux_linguistic_weight 0.1 \
+    --linguistic_root /data1/AdoDas/linguistic_features
+```
+
+Key constraint: linguistic features follow LUPI — available during training as MSE regression
+targets from `participant_repr`, not needed for inference. The head (`AuxLinguisticHead`) is
+a 2-layer MLP predicting 12-dim features, stored in `GroupedModel.aux_linguistic_head`.
+
 ### Optimizations (mtl_full.yaml)
 
 - Uncertainty-weighted multi-task learning (automatic task balancing)

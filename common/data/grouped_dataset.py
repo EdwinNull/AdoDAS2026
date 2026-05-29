@@ -37,11 +37,13 @@ class GroupedParticipantDataset(Dataset):
         session_drop_prob: float = 0.0,
         max_participants: int = 0,
         valid_pids: set[str] | None = None,
+        linguistic_root: str | Path | None = None,
     ) -> None:
         self.cfg = cfg
         self.split = split
         self.session_drop_prob = float(session_drop_prob)
         self.root = Path(cfg.feature_root) / SPLIT_DATA_PATH.get(split, split)
+        self.linguistic_root = Path(linguistic_root) if linguistic_root else None
 
         manifest = pd.read_csv(manifest_path)
 
@@ -294,6 +296,18 @@ class GroupedParticipantDataset(Dataset):
             return self._apply_session_dropout(sample)
         return sample
 
+    def _load_linguistic_features(
+        self, school: str, cls: str, pid: str,
+    ) -> np.ndarray | None:
+        """Load participant-level pooled linguistic features (12-dim float32).
+        Returns None if the extraction hasn't been run for this participant."""
+        if self.linguistic_root is None:
+            return None
+        feat_path = self.linguistic_root / self.split / school / cls / pid / "linguistic_participant.npy"
+        if feat_path.exists():
+            return np.load(str(feat_path)).astype(np.float32)
+        return None
+
     def _load_emotion_dims(self, y_a1: np.ndarray) -> np.ndarray:
         """
         从DASS-21分数推导情绪维度（valence/arousal）
@@ -366,6 +380,14 @@ class GroupedParticipantDataset(Dataset):
             sample["auxiliary_targets"] = {
                 "emotion_dims": torch.from_numpy(self._load_emotion_dims(info["y_a1"])),
             }
+
+        # S2.3: 语言学特征 — 从转录文本离线提取的 12-dim 特征 (LUPI)
+        if self.linguistic_root is not None:
+            ling_feat = self._load_linguistic_features(
+                info["anon_school"], info["anon_class"], info["anon_pid"],
+            )
+            if ling_feat is not None:
+                sample["linguistic_features"] = torch.from_numpy(ling_feat)
 
         return sample
 
@@ -615,6 +637,10 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         result["auxiliary_targets"] = {
             "emotion_dims": torch.stack([b["auxiliary_targets"]["emotion_dims"] for b in batch]),
         }
+
+    # S2.3: 语言学特征 (LUPI, 仅训练时有)
+    if "linguistic_features" in batch[0]:
+        result["linguistic_features"] = torch.stack([b["linguistic_features"] for b in batch])
 
     return result
 
