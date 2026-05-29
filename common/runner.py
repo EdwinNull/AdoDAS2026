@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_corn_loss", type=int, default=None, help="1=use CORN loss for A2")
     p.add_argument("--use_qwk_aux", type=int, default=None, help="1=use differentiable QWK auxiliary loss for A2")
     p.add_argument("--qwk_weight", type=float, default=None, help="QWK auxiliary loss weight for A2")
+    p.add_argument("--use_cb_weight", type=int, default=None, help="1=use Class-Balanced weighting for A2")
+    p.add_argument("--cb_beta", type=float, default=None, help="CB beta parameter (default 0.999)")
 
     p.add_argument("--submission_level", type=str, default=None,
                     choices=["session", "participant"], help="Use participant-level preds for submission")
@@ -117,6 +119,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
+
+    # Structured naming & experiment tracking (unified plan §1.2, §8.2)
+    p.add_argument("--stage", type=str, default=None, help="Stage label, e.g. S0, S1, S2")
+    p.add_argument("--tag", type=str, default=None, help="Experiment tag, e.g. train-fix, loss-corn-cb")
+    p.add_argument("--parent_run", type=str, default=None, help="Parent run name for delta tracking")
+    p.add_argument("--baseline_run", type=str, default=None, help="Baseline run name (root of experiment chain)")
 
     # LUPI 控制参数
     p.add_argument("--aux_lupi_enabled", type=int, default=None, help="1=enable LUPI aux supervision")
@@ -377,6 +385,27 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
             pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, 5.0)
     return torch.from_numpy(pw).unsqueeze(0)
 
+
+def compute_a2_cb_weights(manifest_path: Path, beta: float = 0.999,
+                          n_items: int = 21, n_classes: int = 4) -> torch.Tensor:
+    """Class-Balanced weights per item × class, based on effective sample count.
+
+    W_k = (1 - β) / (1 - β^{n_k})   where n_k is count of class k for this item.
+
+    Returns (n_items, n_classes) float32 tensor.
+    """
+    df = pd.read_csv(manifest_path)
+    item_cols = [f"d{i:02d}" for i in range(1, n_items + 1)]
+    weights = np.ones((n_items, n_classes), dtype=np.float32)
+    for j, col in enumerate(item_cols):
+        vals = df[col].values.astype(int)
+        for k in range(n_classes):
+            n_k = max(int(np.sum(vals == k)), 1)
+            weights[j, k] = (1.0 - beta) / (1.0 - beta ** n_k)
+    # Normalize so mean weight = 1.0 (preserve overall loss scale)
+    weights = weights / weights.mean()
+    return torch.from_numpy(weights)
+
 def train_one_epoch_grouped(
     grouped_model: GroupedModel,
     participant_head: nn.Module,
@@ -411,6 +440,8 @@ def train_one_epoch_grouped(
     lupi_reweight: bool = False,
     reweight_w_low: float = 0.7,
     reweight_w_high: float = 1.2,
+    # Class-Balanced
+    cb_weights: torch.Tensor | None = None,
 ) -> float:
     grouped_model.train()
     participant_head.train()
@@ -490,6 +521,7 @@ def train_one_epoch_grouped(
                     use_qwk=use_qwk_aux,
                     qwk_weight=qwk_weight,
                     loss_components=loss_components,
+                    cb_weights=cb_weights,
                 )
                 if "qwk_loss" in loss_components:
                     accum_qwk_aux_loss += loss_components["qwk_loss"]
@@ -530,6 +562,7 @@ def train_one_epoch_grouped(
                         use_qwk=use_qwk_aux,
                         qwk_weight=qwk_weight,
                         loss_components=loss_components,
+                        cb_weights=cb_weights,
                     )
                     if "qwk_loss" in loss_components:
                         accum_qwk_aux_loss += loss_components["qwk_loss"]
@@ -617,6 +650,8 @@ def train_one_epoch_mtl(
     lupi_reweight: bool = False,
     reweight_w_low: float = 0.7,
     reweight_w_high: float = 1.2,
+    # Class-Balanced
+    cb_weights: torch.Tensor | None = None,
 ) -> tuple[float, dict]:
     """
     使用MTL的训练循环
@@ -699,6 +734,7 @@ def train_one_epoch_mtl(
                 session_loss_weight=session_loss_weight,
                 session_type_loss_weight=session_type_loss_weight,
                 emotion_dims_weight=emotion_dims_weight,
+                cb_weights=cb_weights,
             )
 
             # LUPI: 辅助属性预测损失
@@ -1208,7 +1244,13 @@ def main() -> None:
     log.info(f"Run name: {run_name}")
     log.info(f"Config: {cfg}")
 
-    meta = RunMetadata(run_dirs["root"], cfg, task, run_name)
+    meta = RunMetadata(
+        run_dirs["root"], cfg, task, run_name,
+        stage=cfg.get("stage", args.stage),
+        tag=cfg.get("tag", args.tag),
+        parent_run_name=cfg.get("parent_run", args.parent_run),
+        baseline_run_name=cfg.get("baseline_run", args.baseline_run),
+    )
 
     # Stage 0: 加载 val 二次切分配置（如果存在）
     val_split = None
@@ -1495,6 +1537,16 @@ def main() -> None:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "Train" / "train.csv").to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
+    # Class-Balanced weighting (A2 only, configurable)
+    cb_weights_t = None
+    use_cb_weight = bool(cfg.get("use_cb_weight", False))
+    if task == "a2" and use_cb_weight:
+        cb_beta = cfg.get("cb_beta", 0.999)
+        cb_weights_t = compute_a2_cb_weights(
+            manifest_dir / "Train" / "train.csv", beta=cb_beta,
+        ).to(device)
+        log.info(f"Class-Balanced weights enabled: beta={cb_beta}, shape={cb_weights_t.shape}")
+
     # 优化器参数
     if enable_mtl:
         params = list(optimized_model.parameters())
@@ -1590,6 +1642,7 @@ def main() -> None:
                 lupi_reweight=reweight_enabled,
                 reweight_w_low=aux_lupi_cfg.get("sample_reweight", {}).get("weight_low", 0.7) if reweight_enabled else 0.7,
                 reweight_w_high=aux_lupi_cfg.get("sample_reweight", {}).get("weight_high", 1.2) if reweight_enabled else 1.2,
+                cb_weights=cb_weights_t,
             )
             # 记录详细损失
             if epoch % 5 == 0 or epoch == 1:
@@ -1616,6 +1669,7 @@ def main() -> None:
                 lupi_reweight=reweight_enabled,
                 reweight_w_low=aux_lupi_cfg.get("sample_reweight", {}).get("weight_low", 0.7) if reweight_enabled else 0.7,
                 reweight_w_high=aux_lupi_cfg.get("sample_reweight", {}).get("weight_high", 1.2) if reweight_enabled else 1.2,
+                cb_weights=cb_weights_t,
             )
 
         # 验证（MTL和标准模式都使用相同的验证函数）

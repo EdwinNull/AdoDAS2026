@@ -119,6 +119,7 @@ def compute_optimized_loss(
     session_loss_weight: float = 0.5,
     session_type_loss_weight: float = 0.15,
     emotion_dims_weight: float = 0.05,
+    cb_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     计算优化后的总损失
@@ -157,6 +158,7 @@ def compute_optimized_loss(
             use_qwk=use_qwk_aux,
             qwk_weight=qwk_weight,
             loss_components=loss_components,
+            cb_weights=cb_weights,
         )
     losses.append(main_loss)
     loss_dict["main_loss"] = main_loss.item()
@@ -191,6 +193,7 @@ def compute_optimized_loss(
                 use_qwk=use_qwk_aux,
                 qwk_weight=qwk_weight,
                 loss_components=sess_lc,
+                cb_weights=cb_weights,
             )
 
         # 会话类型分类损失

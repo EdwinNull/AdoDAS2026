@@ -102,6 +102,28 @@ def build_run_name(
     return "__".join(parts)
 
 
+def build_structured_run_name(
+    track: str,
+    stage: str,
+    tag: str,
+    seed: int,
+    fold: int | None = None,
+    timestamp: str | None = None,
+) -> str:
+    """Structured run name following ADODAS2026 unified plan §1.2.
+
+    Format: {track}_{stage}_{tag}_seed{n}[_fold{i}][_{timestamp}]
+
+    Allowed tags per stage — see unified plan §1.3 Tag Registry.
+    """
+    parts = [track, stage, tag, f"seed{seed}"]
+    if fold is not None:
+        parts.append(f"fold{fold}")
+    if timestamp is not None:
+        parts.append(timestamp)
+    return "_".join(parts)
+
+
 def setup_run_dirs(output_root: Path, run_name: str) -> dict[str, Path]:
     run_dir = output_root / "runs" / run_name
     subdirs = {

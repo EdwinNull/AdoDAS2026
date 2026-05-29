@@ -63,6 +63,9 @@ early_stop_min_delta: 0.005
 use_corn_loss: 1
 use_qwk_aux: 1
 qwk_weight: 0.3
+# Class-Balanced weighting (per item × class, based on effective sample count)
+use_cb_weight: 0
+cb_beta: 0.999
 
 # LUPI: Learning Using Privileged Information
 aux_lupi:

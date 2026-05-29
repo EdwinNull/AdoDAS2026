@@ -33,6 +33,10 @@ class RunMetadata:
         cfg: dict[str, Any],
         task: str,
         run_name: str,
+        stage: str | None = None,
+        tag: str | None = None,
+        parent_run_name: str | None = None,
+        baseline_run_name: str | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.meta_path = self.run_dir / "run_meta.json"
@@ -57,6 +61,14 @@ class RunMetadata:
             "best_metrics": {},
             "status": "running",
         }
+        if stage is not None:
+            self.meta["stage"] = stage
+        if tag is not None:
+            self.meta["tag"] = tag
+        if parent_run_name is not None:
+            self.meta["parent_run_name"] = parent_run_name
+        if baseline_run_name is not None:
+            self.meta["baseline_run_name"] = baseline_run_name
         self._save()
 
         try:

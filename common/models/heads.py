@@ -430,6 +430,7 @@ def a2_ordinal_loss(
     use_qwk: bool = False,
     qwk_weight: float = 0.3,
     loss_components: dict | None = None,
+    cb_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     A2 增强序数回归损失（兼容 runner.py 调用接口）
@@ -449,11 +450,13 @@ def a2_ordinal_loss(
         use_corn:        是否使用 CORN 条件序数损失
         use_qwk:         是否使用可微 QWK 辅助损失
         qwk_weight:      QWK 损失的权重
+        cb_weights:      (n_items, n_classes) Class-Balanced weights, optional
 
     返回:
         loss: 标量
     """
     n_thresholds = logits.size(-1)
+    B, I = labels.shape
 
     # 基础损失：标准序数回归 BCE
     targets = A2OrdinalHead.build_ordinal_targets(labels, n_thresholds=n_thresholds)
@@ -462,8 +465,18 @@ def a2_ordinal_loss(
         targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
 
     base_loss = F.binary_cross_entropy_with_logits(
-        logits, targets, pos_weight=pos_weight
-    )
+        logits, targets, pos_weight=pos_weight, reduction="none"
+    )  # (B, I, T)
+
+    # Class-Balanced per-item per-class weighting
+    if cb_weights is not None:
+        cb_w = cb_weights.to(logits.device)  # (I, C=4)
+        gathered = cb_w[torch.arange(I, device=logits.device).unsqueeze(0), labels.long()]  # (B, I)
+        weight_per_sample = gathered.mean(dim=-1)  # (B,)
+        # Mean over items and thresholds, weighted by sample
+        base_loss = (base_loss.mean(dim=(-1, -2)) * weight_per_sample).mean()
+    else:
+        base_loss = base_loss.mean()
 
     total_loss = base_loss
 
