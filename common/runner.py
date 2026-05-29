@@ -2340,26 +2340,34 @@ def main() -> None:
             log.info("  Evaluating SWA checkpoint on val_holdout ...")
             for name, param in (optimized_model if enable_mtl else grouped_model).named_parameters():
                 param.data.copy_(swa_state[name].to(param.device))
-            # SWA uses same decode/offsets/prior as best
             swa_logits, swa_labels = collect_val_logits_grouped_a2(
                 grouped_model, participant_head, session_head, val_holdout_loader, device, use_amp,
                 submission_level=submission_level,
             )
             swa_labels_int = swa_labels.astype(int)
             swa_logits_t = torch.from_numpy(swa_logits).float()
-            if prior_weights_final is not None:
-                swa_logits_t = _apply_a2_prior_bias(swa_logits_t, prior_weights_final)
-            if a2_offsets is not None:
-                swa_logits_t = swa_logits_t + torch.as_tensor(a2_offsets, dtype=torch.float32)
-            swa_preds = _decode_a2_logits(
+            # Raw SWA (no prior bias, no offsets)
+            swa_preds_raw = _decode_a2_logits(
                 decode_head, swa_logits_t,
                 decode_method=selected_decode_method,
             ).cpu().numpy()
-            val_hout_qwk_swa = mean_qwk(swa_preds, swa_labels_int)
-            val_hout_mae_swa = mean_mae(swa_preds, swa_labels_int)
+            val_hout_qwk_swa_raw = mean_qwk(swa_preds_raw, swa_labels_int)
+            # Calibrated SWA (same prior/offsets as best.pt)
+            if prior_weights_final is not None:
+                swa_logits_t = _apply_a2_prior_bias(swa_logits_t, prior_weights_final)
+            swa_logits_cal = swa_logits_t
+            if a2_offsets is not None:
+                swa_logits_cal = swa_logits_cal + torch.as_tensor(a2_offsets, dtype=torch.float32)
+            swa_preds_cal = _decode_a2_logits(
+                decode_head, swa_logits_cal,
+                decode_method=selected_decode_method,
+            ).cpu().numpy()
+            val_hout_qwk_swa = mean_qwk(swa_preds_cal, swa_labels_int)
+            val_hout_mae_swa = mean_mae(swa_preds_cal, swa_labels_int)
             log.info(
-                f"  [SWA] val_holdout: calibrated QWK={val_hout_qwk_swa:.4f}, "
-                f"MAE={val_hout_mae_swa:.4f}  (best.pt QWK={val_hout_qwk_cal:.4f})"
+                f"  [SWA] val_holdout: raw QWK={val_hout_qwk_swa_raw:.4f}, "
+                f"calibrated QWK={val_hout_qwk_swa:.4f}, MAE={val_hout_mae_swa:.4f}  "
+                f"(best.pt: raw={val_hout_qwk_raw:.4f}, cal={val_hout_qwk_cal:.4f})"
             )
             # Restore best checkpoint weights
             load_checkpoint(run_dirs["checkpoints"] / "best.pt",
@@ -2380,6 +2388,7 @@ def main() -> None:
             "val_holdout_qwk_raw": float(val_hout_qwk_raw) if val_hout_qwk_raw is not None else None,
             "val_holdout_qwk_calibrated": float(val_hout_qwk_cal) if val_hout_qwk_cal is not None else None,
             "val_holdout_mae_calibrated": float(val_hout_mae_cal) if val_hout_mae_cal is not None else None,
+            "val_holdout_qwk_swa_raw": float(val_hout_qwk_swa_raw) if val_hout_qwk_swa_raw is not None else None,
             "val_holdout_qwk_swa": float(val_hout_qwk_swa) if val_hout_qwk_swa is not None else None,
             "val_holdout_mae_swa": float(val_hout_mae_swa) if val_hout_mae_swa is not None else None,
             "decode_method": selected_decode_method,
