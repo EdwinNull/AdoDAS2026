@@ -9,13 +9,13 @@ cd "$PROJECT_DIR"
 
 # ---- 默认配置 ----
 TASK="a2"
-PRESET="default"
+PRESET="full"
 GPU="0"
 GPU_EXPLICIT=0
 GPU_WAIT=0
 GPU_FREE_GB=28
 GPU_IDLE_DURATION=30
-LUPI=""
+LUPI="both"
 EXTRA_ARGS=()
 
 # ---- 预设配置 ----
@@ -32,13 +32,14 @@ usage() {
 选项:
   --task a1|a2         任务 (默认: a2)
   --preset name         配置预设:
-                          default   - 基线配置 (Stage 1: 训练稳定化)
-                          full      - 全量优化 (MTL+增强损失+UW约束+LUPI关闭)
+                          full      - 全量 MTL+UW+LUPI (默认)
+                          default   - 单任务基线 CORN+QWK
                           debug     - 快速调试 (100人, 2 epochs)
-  --lupi mode           LUPI 模式:
+  --lupi mode           LUPI 模式 (默认: both):
                           heads     - 辅助属性预测头
                           weight    - 样本一致性加权
                           both      - 两者同时启用
+                          ""        - 关闭 LUPI
   --gpu N               GPU ID (默认: 0)
   --gpu-wait            等待 GPU 空闲显存 ≥28GB 后自动启动
   --gpu-free-gb N       所需空闲显存 GB 数 (配合 --gpu-wait, 默认 28)
@@ -53,19 +54,17 @@ usage() {
   ADODAS_OUTPUT_ROOT    输出根目录 (默认: ./output)
 
 示例:
-  # 直接启动
-  ./run_train.sh --task a2 --preset default
+  # 默认：full MTL + LUPI both
+  ./run_train.sh
 
-  # 等待 GPU 空闲 ≥28GB 后自动启动 (推荐, 27GB训练+1GB余量)
-  ./run_train.sh --task a2 --preset full --gpu-wait
+  # 仅基线对比
+  ./run_train.sh --preset default --lupi ""
 
-  # 等待 GPU 0 空闲 40GB，持续 60s
-  ./run_train.sh --task a2 --preset full --gpu 0 --gpu-wait \
-      --gpu-free-gb 40 --gpu-idle-duration 60
+  # Stage 2: +CB +语言学
+  ./run_train.sh --extra "--use_cb_weight 1 --use_aux_linguistic 1"
 
-  # A2 + LUPI
-  ./run_train.sh --task a2 --preset default --lupi heads
-  ./run_train.sh --task a2 --preset full --lupi both
+  # 调试模式
+  ./run_train.sh --preset debug
 
 数据加载 (通过 --extra 控制):
   --extra "--use_hdf5 1 --preload 1"       # HDF5 全量预载
