@@ -21,20 +21,20 @@ Data root defaults to `/data1/AdoDas`. Override via `ADODAS_DATA_ROOT`.
 ### Training
 
 ```bash
-# A2 baseline (default preset)
-./run_train.sh --task a2 --preset default
+# Default: full MTL + LUPI both
+./run_train.sh
 
-# A2 full MTL (uncertainty weighting + auxiliary tasks)
-./run_train.sh --task a2 --preset full
+# Baseline comparison only (single-task, no LUPI)
+./run_train.sh --preset default --lupi ""
 
-# A1
-./run_train.sh --task a1 --preset default
+# Stage 2: Class-Balanced weighting (opt-in)
+./run_train.sh --extra "--use_cb_weight 1 --cb_beta 0.999"
 
-# with LUPI
-./run_train.sh --task a2 --preset default --lupi both
+# Debug mode (100 participants, 2 epochs)
+./run_train.sh --preset debug
 
-# wait for GPU ≥28GB free then auto-launch
-./run_train.sh --task a2 --preset full --gpu-wait
+# Wait for GPU >= 28GB free then auto-launch
+./run_train.sh --gpu-wait
 
 # Stage 1 ablation chain (4 experiments, sequential)
 python scripts/run_ablation.py --stop-on-error
@@ -42,14 +42,14 @@ python scripts/run_ablation.py --stop-on-error
 
 | preset | config | description |
 |--------|--------|-------------|
-| `default` | `tasks/a2/default.yaml` | single-task training, CORN+QWK loss |
-| `full` | `tasks/a2/mtl_full.yaml` | 4-task MTL + uncertainty weighting + per-task log_var clamping |
-| `debug` | default + overrides | 100 participants, 2 epochs for pipeline validation |
+| `full` (default) | `tasks/a2/mtl_full.yaml` | 4-task MTL + UW + LUPI both |
+| `default` | `tasks/a2/default.yaml` | single-task, CORN+QWK loss |
+| `debug` | default + overrides | 100 participants, 2 epochs |
 
 ### Inference
 
 ```bash
-# pure argmax (default, no calibration — recommended for leaderboard)
+# pure argmax (default, no calibration -- recommended for leaderboard)
 python scripts/run_predict_a2.py \
   --run-dir output/runs/<run_name> \
   --output output/pred.csv
@@ -63,24 +63,38 @@ python scripts/run_predict_a2.py \
 ### GPU monitoring
 
 ```bash
-# wait for GPU free ≥28GB, then run command
+# wait for GPU free >= 28GB, then run command
 python scripts/gpu_monitor_train.py \
   --free-gb 28 --idle-duration 30 \
-  --command "./run_train.sh --task a2 --preset default"
+  --command "./run_train.sh"
 ```
 
 ## Config Presets
 
-Both `default` and `full` share the same model architecture, features, and loss functions. The difference is in training strategy:
-
-| | default | full |
+| | default | full (default) |
 |---|---|---|
 | training objective | main task only | 4-task MTL (main + session + session_type + emotion_dims) |
 | task balancing | fixed weights | Kendall uncertainty weighting + per-task clamping |
+| LUPI | disabled | both (aux heads + sample reweight) |
 | GPU preallocation | none | 27GB |
 | cross-modal attention | n/a | available (default off) |
 
 See `docs/default_vs_full_config.md` for full details.
+
+## Stage 2: Class-Balanced Weighting (opt-in)
+
+CB reweights per-item per-class loss by effective sample count, counteracting the extreme class imbalance in DASS-21 scores (70/22/5/2% for classes 0/1/2/3).
+
+```bash
+./run_train.sh --extra "--use_cb_weight 1 --cb_beta 0.999"
+```
+
+| flag | default | description |
+|------|---------|-------------|
+| `use_cb_weight` | 0 | Enable Class-Balanced weighting |
+| `cb_beta` | 0.999 | Smoothing factor (closer to 1 = stronger reweighting) |
+
+Weight formula: `(1 - beta) / (1 - beta^n)` per (item, class), normalized to mean = 1.0.
 
 ## Project Structure
 
@@ -123,14 +137,14 @@ output/runs/<run_name>/
 
 | session | content |
 |---------|---------|
-| A01 | standardized reading passage ("北风和太阳") |
+| A01 | standardized reading passage ("北风和太阳")
 | B01 | describe yesterday |
 | B02 | happiest memory from past week |
 | B03 | saddest memory from past week |
 
 ## Auxiliary Attributes (LUPI)
 
-5 categorical features available in training CSV, encoded via embeddings, used when `--lupi` is enabled:
+5 categorical features available in training CSV, encoded via embeddings, enabled by default when LUPI is active:
 
 1. Family structure (6 classes)
 2. Only child status (2 classes)
