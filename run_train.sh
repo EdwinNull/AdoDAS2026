@@ -91,7 +91,12 @@ while [[ $# -gt 0 ]]; do
         --gpu-idle-duration)
             GPU_IDLE_DURATION="$2"; shift 2 ;;
         --name)
-            EXTRA_ARGS+=("--run_name" "$2"); shift 2 ;;
+            _name="$2"
+            _name="${_name//\"/}"   # strip Unicode left double quote U+201C
+            _name="${_name//\"/}"   # strip Unicode right double quote U+201D
+            _name="${_name//\"/}"   # strip ASCII double quote
+            _name="${_name//\'/}"   # strip ASCII single quote
+            EXTRA_ARGS+=("--run_name" "$_name"); shift 2 ;;
         --extra)
             EXTRA_ARGS+=($2); shift 2 ;;
         -h|--help)
