@@ -30,11 +30,13 @@ class HDF5GroupedDataset(Dataset):
         session_drop_prob: float = 0.0,
         preload: bool = False,
         valid_pids: set[str] | None = None,
+        linguistic_root: str | Path | None = None,
     ):
         self.hdf5_path = Path(hdf5_path)
         self.session_drop_prob = float(session_drop_prob)
         self._preload = preload
         self._cache: list[dict | None] | None = None
+        self.linguistic_root = Path(linguistic_root) if linguistic_root else None
 
         # 打开HDF5文件获取元信息
         with h5py.File(self.hdf5_path, 'r') as f:
@@ -115,6 +117,17 @@ class HDF5GroupedDataset(Dataset):
             "session_valid": grp['session_valid'][:],
             "session_names": SESSIONS,
         }
+
+        # S2.3: 加载语言学特征 (LUPI, 从文件系统)
+        if self.linguistic_root is not None:
+            anon_pid = str(grp.attrs['anon_pid'])
+            anon_school = str(grp.attrs['anon_school'])
+            anon_class = str(grp.attrs['anon_class'])
+            ling_path = self.linguistic_root / self.split / anon_school / anon_class / anon_pid / "linguistic_participant.npy"
+            if ling_path.exists():
+                sample["linguistic_features"] = torch.from_numpy(
+                    np.load(str(ling_path)).astype(np.float32)
+                )
 
         # 加载所有session
         sessions = []

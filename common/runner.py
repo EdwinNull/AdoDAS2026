@@ -448,6 +448,8 @@ def train_one_epoch_grouped(
     reweight_w_high: float = 1.2,
     # Class-Balanced
     cb_weights: torch.Tensor | None = None,
+    # S2.3: 语言学特征辅助监督
+    aux_linguistic_weight: float = 0.1,
 ) -> float:
     grouped_model.train()
     participant_head.train()
@@ -588,7 +590,16 @@ def train_one_epoch_grouped(
                     out["aux_logits"], aux_attrs, weights=aux_lupi_weights,
                 )
 
-            loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss + aux_loss
+            # S2.3: 语言学特征辅助监督
+            ling_loss = p_logits.new_zeros(())
+            if out.get("aux_ling_pred") is not None and batch.get("linguistic_features") is not None:
+                ling_loss = aux_linguistic_loss(
+                    out["aux_ling_pred"], batch["linguistic_features"].to(device),
+                    weight=aux_linguistic_weight,
+                )
+
+            loss = (main_loss + session_loss_weight * sess_loss +
+                    session_type_loss_weight * type_loss + aux_loss + ling_loss)
             if lupi_reweight:
                 loss = loss + 0.3 * (rew_loss_a1 if task == "a1" else rew_loss_a2)
 
@@ -658,6 +669,8 @@ def train_one_epoch_mtl(
     reweight_w_high: float = 1.2,
     # Class-Balanced
     cb_weights: torch.Tensor | None = None,
+    # S2.3: 语言学特征辅助监督
+    aux_linguistic_weight: float = 0.1,
 ) -> tuple[float, dict]:
     """
     使用MTL的训练循环
@@ -771,6 +784,15 @@ def train_one_epoch_mtl(
                 rew_loss = (per_sample * sample_w).mean()
                 loss = loss + 0.3 * rew_loss
                 loss_dict["rew_main_loss"] = rew_loss.item()
+
+            # S2.3: 语言学特征辅助监督
+            if outputs.get("aux_ling_pred") is not None and batch.get("linguistic_features") is not None:
+                ling_loss = aux_linguistic_loss(
+                    outputs["aux_ling_pred"], batch["linguistic_features"].to(device),
+                    weight=aux_linguistic_weight,
+                )
+                loss = loss + ling_loss
+                loss_dict["aux_ling_loss"] = ling_loss.item()
 
         # 反向传播
         optimizer.zero_grad()
@@ -1290,6 +1312,12 @@ def main() -> None:
     use_hdf5 = bool(cfg.get("use_hdf5", False))
     max_pts = cfg.get("max_participants", 0) or 0
 
+    # S2.3: 语言学特征根目录 (仅训练时使用)
+    use_ling = bool(cfg.get("use_aux_linguistic", False))
+    linguistic_root = Path(cfg["linguistic_root"]) if use_ling and cfg.get("linguistic_root") else None
+    if use_ling and linguistic_root is None:
+        log.warning("use_aux_linguistic=1 but no linguistic_root set; linguistic aux supervision disabled")
+
     # Stage 0: 准备 val 切分的 PID 集合
     val_select_pids: set[str] | None = None
     val_holdout_pids: set[str] | None = None
@@ -1317,6 +1345,7 @@ def main() -> None:
             hdf5_path=train_hdf5,
             session_drop_prob=cfg.get("session_drop_prob", 0.1),
             preload=preload,
+            linguistic_root=linguistic_root,
         )
         if use_val_split:
             val_select_ds = HDF5GroupedDataset(
@@ -1346,6 +1375,7 @@ def main() -> None:
             manifest_dir / "Train" / "train.csv", feat_cfg, split="train",
             session_drop_prob=cfg.get("session_drop_prob", 0.1),
             max_participants=max_pts,
+            linguistic_root=linguistic_root,
         )
         if use_val_split:
             val_select_ds = GroupedParticipantDataset(
@@ -1462,6 +1492,16 @@ def main() -> None:
         )
         log.info(f"LUPI aux heads enabled")
 
+    # S2.3: 语言学特征预测头 (LUPI — 从纯音视频表示预测12-dim语言特征)
+    aux_ling_head = None
+    if use_ling:
+        hidden = cfg.get("aux_linguistic_hidden", 64)
+        aux_ling_head = AuxLinguisticHead(
+            d_in=bb_cfg.d_shared, hidden=hidden,
+            dropout=cfg.get("dropout", 0.2),
+        )
+        log.info(f"Linguistic aux head enabled: d_in={bb_cfg.d_shared}, hidden={hidden}")
+
     grouped_model = GroupedModel(
         backbone=backbone,
         d_shared=bb_cfg.d_shared,
@@ -1469,6 +1509,7 @@ def main() -> None:
         dropout=cfg.get("dropout", 0.2),
         aux_encoder=aux_encoder,
         aux_heads=aux_heads,
+        aux_linguistic_head=aux_ling_head,
     ).to(device)
 
     use_coral = bool(cfg.get("use_coral", False))
@@ -1649,6 +1690,7 @@ def main() -> None:
                 reweight_w_low=aux_lupi_cfg.get("sample_reweight", {}).get("weight_low", 0.7) if reweight_enabled else 0.7,
                 reweight_w_high=aux_lupi_cfg.get("sample_reweight", {}).get("weight_high", 1.2) if reweight_enabled else 1.2,
                 cb_weights=cb_weights_t,
+                aux_linguistic_weight=cfg.get("aux_linguistic_weight", 0.1),
             )
             # 记录详细损失
             if epoch % 5 == 0 or epoch == 1:
@@ -1676,6 +1718,7 @@ def main() -> None:
                 reweight_w_low=aux_lupi_cfg.get("sample_reweight", {}).get("weight_low", 0.7) if reweight_enabled else 0.7,
                 reweight_w_high=aux_lupi_cfg.get("sample_reweight", {}).get("weight_high", 1.2) if reweight_enabled else 1.2,
                 cb_weights=cb_weights_t,
+                aux_linguistic_weight=cfg.get("aux_linguistic_weight", 0.1),
             )
 
         # 验证（MTL和标准模式都使用相同的验证函数）

@@ -469,12 +469,13 @@ def a2_ordinal_loss(
     )  # (B, I, T)
 
     # Class-Balanced per-item per-class weighting
+    # Weight each (item, threshold) by the CB weight of the corresponding class,
+    # rather than reducing to a per-sample scalar (which is scale-invariant under Adam).
     if cb_weights is not None:
         cb_w = cb_weights.to(logits.device)  # (I, C=4)
         gathered = cb_w[torch.arange(I, device=logits.device).unsqueeze(0), labels.long()]  # (B, I)
-        weight_per_sample = gathered.mean(dim=-1)  # (B,)
-        # Mean over items and thresholds, weighted by sample
-        base_loss = (base_loss.mean(dim=(-1, -2)) * weight_per_sample).mean()
+        weight = gathered.unsqueeze(-1)  # (B, I, 1) — one weight per item, shared across thresholds
+        base_loss = (base_loss * weight).mean()
     else:
         base_loss = base_loss.mean()
 
@@ -609,7 +610,3 @@ def aux_linguistic_loss(
     if valid.sum() == 0:
         return pred.new_zeros(())
     return weight * F.mse_loss(pred[valid], targets[valid])
-
-    return total, acc_dict
-
-    return total, acc_dict

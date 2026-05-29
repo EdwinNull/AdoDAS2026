@@ -638,9 +638,16 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             "emotion_dims": torch.stack([b["auxiliary_targets"]["emotion_dims"] for b in batch]),
         }
 
-    # S2.3: 语言学特征 (LUPI, 仅训练时有)
+    # S2.3: 语言学特征 (LUPI, 仅训练时有; 缺失者填 NaN, loss 端 isNaN 跳过)
     if "linguistic_features" in batch[0]:
-        result["linguistic_features"] = torch.stack([b["linguistic_features"] for b in batch])
+        N_LING = 12
+        stacked = []
+        for b in batch:
+            if "linguistic_features" in b:
+                stacked.append(b["linguistic_features"])
+            else:
+                stacked.append(torch.full((N_LING,), float("nan")))
+        result["linguistic_features"] = torch.stack(stacked)
 
     return result
 
