@@ -140,6 +140,7 @@ class TestPackageGroupedDataset(GroupedParticipantDataset):
         self.split = ""  # path-effective; load_sequence ignores split,
                          # load_egemaps_pooled concatenates Path / "" → identity.
         self.session_drop_prob = 0.0
+        self.linguistic_root = None  # not needed at inference
         self.school_to_root = school_to_root
         # self.root is set per-call by _load_single_session / _probe_dims
         # via _set_root_for_school(); seed it with any package.
