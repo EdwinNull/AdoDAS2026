@@ -118,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_hdf5", type=int, default=None, help="1=use HDF5 packed dataset")
     p.add_argument("--patience", type=int, default=None)
     p.add_argument("--grad_clip", type=float, default=None)
+    p.add_argument("--run_name", type=str, default=None, help="override auto-generated run name")
     p.add_argument("--run_inference_after_train", type=int, default=None)
 
     # Structured naming & experiment tracking (unified plan §1.2, §8.2)
@@ -1240,7 +1241,7 @@ def main() -> None:
     manifest_dir = Path(cfg.get("manifest_dir", "/data1/AdoDas"))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = build_run_name(cfg, task, timestamp, training_mode="grouped_participant")
+    run_name = cfg.get("run_name") or build_run_name(cfg, task, timestamp, training_mode="grouped_participant")
     run_dirs = setup_run_dirs(output_root, run_name)
 
     setup_logging(run_dirs["logs"], task)
