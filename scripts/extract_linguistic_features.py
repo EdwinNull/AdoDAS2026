@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -132,62 +131,49 @@ def process_split(
     """Process all participants in a split."""
     transcript_dir = transcript_root / split
 
-    # Discover participants with sessions
-    pid_sessions: dict[str, set[str]] = {}
+    # Discover participants with sessions, building pid→(school, class, sessions) map
+    pid_info: dict[str, tuple[str, str, set[str]]] = {}
     for sch in sorted(transcript_dir.iterdir()):
         if not sch.is_dir():
             continue
-        for cls in sorted(sch.iterdir()):
-            if not cls.is_dir():
+        school = sch.name
+        for cls_dir in sorted(sch.iterdir()):
+            if not cls_dir.is_dir():
                 continue
-            for pid_dir in sorted(cls.iterdir()):
+            cls = cls_dir.name
+            for pid_dir in sorted(cls_dir.iterdir()):
                 if not pid_dir.is_dir():
                     continue
                 pid = pid_dir.name
                 sessions = set()
                 for sess in sorted(pid_dir.iterdir()):
-                    if sess.is_dir() and sess in {"A01", "B01", "B02", "B03"}:
-                        txt = pid_dir / sess / "clean_transcript.txt"
+                    if sess.is_dir() and sess.name in {"A01", "B01", "B02", "B03"}:
+                        txt = pid_dir / sess.name / "clean_transcript.txt"
                         if txt.exists():
-                            sessions.add(sess)
+                            sessions.add(sess.name)
                 if sessions:
-                    pid_sessions[pid] = sessions
+                    pid_info[pid] = (school, cls, sessions)
 
-    log.info(f"Processing {split}: {len(pid_sessions)} participants")
+    log.info(f"Processing {split}: {len(pid_info)} participants")
 
     errors = 0
-    for pid, sessions in tqdm(pid_sessions.items(), desc=f"Extract {split}", dynamic_ncols=True):
-        # Compute path using same structure as feature data
-        # Find the participant's school/class from transcript tree
-        pid_dir = None
-        for root, dirs, _ in os.walk(str(transcript_dir)):
-            if os.path.basename(root) == pid:
-                pid_dir = Path(root)
-                break
-
-        if pid_dir is None:
-            errors += 1
-            continue
-
-        rel_parts = pid_dir.relative_to(transcript_dir).parts
-        school, cls = rel_parts[0], rel_parts[1]
-
+    for pid, (school, cls, sessions) in tqdm(pid_info.items(), desc=f"Extract {split}", dynamic_ncols=True):
         session_feats = {}
-        for sess in sessions:
+        for sess in sorted(sessions):
             feats = extract_session_features(transcript_dir, f"{school}/{cls}/{pid}", sess)
             if feats is not None:
                 session_feats[sess] = feats
-                # Save per-session
                 out_dir = output_root / split / school / cls / pid / sess
                 out_dir.mkdir(parents=True, exist_ok=True)
                 np.save(str(out_dir / "linguistic.npy"), feats)
 
-        # Pool to participant level (mean over available sessions)
         if session_feats:
             participant_feat = np.mean(list(session_feats.values()), axis=0)
             out_dir = output_root / split / school / cls / pid
             out_dir.mkdir(parents=True, exist_ok=True)
             np.save(str(out_dir / "linguistic_participant.npy"), participant_feat.astype(np.float32))
+        else:
+            errors += 1
 
     if errors > 0:
         log.warning(f"{split}: {errors} participants had errors")
@@ -207,9 +193,9 @@ def main():
     output_root = Path(args.output_root)
 
     split_map = {
-        "train": "train_transcript",
-        "val": "val_transcript",
-        "test_hidden": "test_transcript",
+        "train": "Train/train_transcript",
+        "val": "Val/val_transcript",
+        "test_hidden": "Test/test_transcript",
     }
 
     splits = list(split_map.keys()) if args.split == "all" else [args.split]
