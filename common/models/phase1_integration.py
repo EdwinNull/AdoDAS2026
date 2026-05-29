@@ -168,6 +168,7 @@ def compute_optimized_loss(
     # 2. 会话级任务损失
     valid_session_mask = session_valid.reshape(-1).bool()
     has_valid_sessions = bool(valid_session_mask.any().item())
+    sess_lc: dict[str, float] = {}
 
     if has_valid_sessions:
         s_logits = outputs["session_logits"][valid_session_mask]
