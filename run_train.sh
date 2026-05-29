@@ -66,10 +66,9 @@ usage() {
   # 调试模式
   ./run_train.sh --preset debug
 
-数据加载 (通过 --extra 控制):
-  --extra "--use_hdf5 1 --preload 1"       # HDF5 全量预载
+数据加载 (默认 HDF5 全量预载到内存, 如需切换):
+  --extra "--use_hdf5 0 --preload 1"       # 原始文件全量预载
   --extra "--use_hdf5 1 --preload 0"       # HDF5 按需加载
-  --extra "--preload 1 --preload_workers 4" # Raw 文件预载
 EOF
     exit 0
 }

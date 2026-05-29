@@ -106,7 +106,7 @@ num_workers: 8
 preload_workers: 4                 # preload 并行数，不宜超过 8
 amp: true
 preload: true
-use_hdf5: false
+use_hdf5: true
 grad_clip: 1.0
 use_pos_weight: true
 patience: 6
