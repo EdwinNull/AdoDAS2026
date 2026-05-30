@@ -39,7 +39,10 @@ from common.models.aux_encoder import AuxiliaryAttributeEncoder
 from common.models.grouped_model import CORALHead, GroupedModel
 from common.models.heads import A2OrdinalHead
 from common.models.mtcn_backbone import BackboneConfig, MTCNBackbone
-from common.runner import _decode_a2_logits, _normalize_decode_method
+from common.runner import (
+    _apply_a2_prior_bias, _build_prior_class_weights,
+    _decode_a2_logits, _normalize_decode_method,
+)
 
 log = logging.getLogger("predict_a2")
 
@@ -343,6 +346,7 @@ def _match_ssl_tag(
 # ---------------------------------------------------------------------------
 
 def load_calibration(run_dir: Path) -> tuple[str, np.ndarray | None]:
+    """Load threshold offsets from calibration file."""
     cal_path = run_dir / "calibration" / "a2_threshold_offsets_grouped.json"
     if not cal_path.exists():
         log.warning(f"No calibration file at {cal_path}; using raw argmax decode")
@@ -359,6 +363,26 @@ def load_calibration(run_dir: Path) -> tuple[str, np.ndarray | None]:
             offsets = np.asarray(strat_info["offsets"], dtype=np.float32)
             log.info(f"Loaded calibrated offsets shape={offsets.shape}")
     return decode_method, offsets
+
+
+def load_prior_bias(run_dir: Path) -> torch.Tensor | None:
+    """Load prior bias weights from calibration file. Returns None if identity or not enabled."""
+    cal_path = run_dir / "calibration" / "a2_threshold_offsets_grouped.json"
+    if not cal_path.exists():
+        return None
+    with open(cal_path) as f:
+        cal = json.load(f)
+    pb = cal.get("prior_bias")
+    if not pb or not pb.get("enabled"):
+        return None
+    am = float(pb.get("alpha_mid", 1.0))
+    ae = float(pb.get("alpha_ext", 1.0))
+    if abs(am - 1.0) < 1e-6 and abs(ae - 1.0) < 1e-6:
+        log.info("Prior bias identity (α_mid=α_ext=1.0), skipping")
+        return None
+    pw = _build_prior_class_weights(am, ae)
+    log.info(f"Loaded prior bias weights: α_mid={am:.3f}, α_ext={ae:.3f}")
+    return pw
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +407,7 @@ def run_inference(
     device: torch.device,
     decode_method: str,
     offsets: np.ndarray | None,
+    prior_weights: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     grouped_model.eval()
     participant_head.eval()
@@ -390,10 +415,15 @@ def run_inference(
     offsets_t = None
     if offsets is not None:
         offsets_t = torch.from_numpy(offsets).float().to(device)
+    prior_w_t = prior_weights.to(device) if prior_weights is not None else None
 
     method = _normalize_decode_method(decode_method)
-    log.info(f"Decoding logits with method='{method}'"
-             + (" + threshold offsets" if offsets_t is not None else ""))
+    parts = [f"decode={method}"]
+    if prior_w_t is not None:
+        parts.append("prior_bias")
+    if offsets_t is not None:
+        parts.append("offsets")
+    log.info("Inference: %s", ", ".join(parts))
 
     out_rows: list[dict[str, Any]] = []
     pbar = tqdm(loader, desc="Predict", dynamic_ncols=True, unit="batch")
@@ -408,6 +438,8 @@ def run_inference(
 
         result = grouped_model(flat, n_p, valid, aux)
         logits = participant_head(result["participant_repr"]).float()
+        if prior_w_t is not None:
+            logits = _apply_a2_prior_bias(logits, prior_w_t)
         if offsets_t is not None:
             logits = logits + offsets_t  # broadcast (n_items, n_thresholds)
 
@@ -436,11 +468,16 @@ def run_inference_ensemble(
     loader: DataLoader,
     device: torch.device,
     decode_method: str,
+    prior_weights: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     """Top-K logit ensemble: load K checkpoints, average logits in FP32."""
     method = _normalize_decode_method(decode_method)
     K = len(ckpt_paths)
-    log.info(f"Top-{K} ensemble: averaging logits from {K} checkpoints, decode={method}")
+    prior_w_t = prior_weights.to(device) if prior_weights is not None else None
+    parts = [f"Top-{K} ensemble", f"decode={method}"]
+    if prior_w_t is not None:
+        parts.append("prior_bias")
+    log.info(": ".join(parts))
 
     # Build a model + head pair for each checkpoint
     head_state_dicts: list[dict[str, torch.Tensor]] = []
@@ -478,8 +515,10 @@ def run_inference_ensemble(
             logits = ph(result["participant_repr"]).float()
             all_logits.append(logits)
 
-        # Average in FP32, then decode
+        # Average in FP32, apply prior bias, then decode
         avg_logits = torch.stack(all_logits).mean(dim=0)
+        if prior_w_t is not None:
+            avg_logits = _apply_a2_prior_bias(avg_logits, prior_w_t)
         preds = _decode_a2_logits(participant_heads[0], avg_logits, decode_method=method)
         preds_np = preds.detach().cpu().numpy().astype(int)
 
@@ -551,8 +590,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--template-csv", type=Path, default=TEMPLATE_CSV,
                    help="CSV with the canonical row order / columns to match")
     p.add_argument("--calibrate", action="store_true",
-                   help="Opt-in: load calibration offsets and use the val-selected decode "
-                        "strategy (default: pure argmax, no calibration)")
+                   help="Apply threshold offset calibration from training")
+    p.add_argument("--prior-bias", action="store_true",
+                   help="Apply S3.1 prior bias weights (α_mid/α_ext) from training")
     p.add_argument("--topk", type=int, default=0,
                    help="Top-K ensemble: average logits from K checkpoints "
                         "(reads topk_epochs from run_meta.json, or scans ckpt_epoch*.pt)")
@@ -713,11 +753,20 @@ def main() -> int:
     )
 
     # ---- calibration & decode ----
+    offsets = None
+    prior_weights = None
+    decode_method = "argmax"
+
+    if args.calibrate:
+        decode_method, offsets = load_calibration(run_dir)
+        log.info("calibration: %s, offsets=%s", decode_method, offsets is not None)
+    if args.prior_bias:
+        prior_weights = load_prior_bias(run_dir)
+        log.info("prior bias: %s", prior_weights is not None)
+
     if args.topk > 0:
-        # Top-K ensemble: find epoch checkpoints from run_meta or scan
         topk_epochs = meta.get("topk_epochs") or meta.get("final_selected_metrics", {}).get("topk_epochs", [])
         if not topk_epochs:
-            # Fallback: scan ckpt_epoch*.pt files
             ckpt_dir = run_dir / "checkpoints"
             epoch_files = sorted(ckpt_dir.glob("ckpt_epoch*.pt"))
             topk_epochs = [int(f.stem.replace("ckpt_epoch", "")) for f in epoch_files]
@@ -726,26 +775,17 @@ def main() -> int:
             log.error("No top-K checkpoints found (run did not use --top_k_ensemble?)")
             return 2
         ckpt_paths = [run_dir / "checkpoints" / f"ckpt_epoch{ep:03d}.pt" for ep in topk_epochs[:K_actual]]
-        decode_method = "argmax"
-        log.info("Top-%d ensemble: raw argmax, no calibration", K_actual)
-        log.info("  epochs: %s", topk_epochs[:K_actual])
-    elif args.calibrate:
-        decode_method, offsets = load_calibration(run_dir)
-        log.info("calibration applied: %s, decode: %s",
-                 offsets is not None, decode_method)
+        log.info("Top-%d ensemble: epochs=%s", K_actual, topk_epochs[:K_actual])
     else:
-        decode_method = "argmax"
-        offsets = None
-        log.info("calibration applied: False, decode: argmax")
-    log.info("checkpoint: %s", ckpt_path)
+        log.info("checkpoint: %s", ckpt_path)
 
     log.info(f"Running inference: {len(dataset)} participants, "
              f"batch_size={args.batch_size}, workers={args.num_workers} ...")
     if args.topk > 0:
-        rows = run_inference_ensemble(ckpt_paths, cfg, loader, device, decode_method)
+        rows = run_inference_ensemble(ckpt_paths, cfg, loader, device, decode_method, prior_weights)
     else:
         rows = run_inference(grouped_model, participant_head, loader, device,
-                             decode_method, offsets)
+                             decode_method, offsets, prior_weights)
     log.info(f"Inference complete: {len(rows)} predictions")
 
     pred_df = pd.DataFrame(rows)
