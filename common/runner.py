@@ -2335,6 +2335,7 @@ def main() -> None:
 
         # S3.3: Evaluate SWA checkpoint if available
         val_hout_qwk_swa = None
+        val_hout_qwk_swa_raw = None
         val_hout_mae_swa = None
         if use_swa and swa_ckpt_path is not None and swa_ckpt_path.exists() and val_holdout_loader is not None:
             log.info("  Evaluating SWA checkpoint on val_holdout ...")
